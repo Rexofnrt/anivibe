@@ -1,0 +1,1058 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  BarChart3,
+  Compass,
+  Heart,
+  Search,
+  Sparkles,
+  ThumbsDown,
+  ThumbsUp,
+  Tv,
+  WandSparkles,
+} from "lucide-react";
+import {
+  Cell,
+  Pie,
+  PieChart,
+  PolarAngleAxis,
+  PolarGrid,
+  Radar,
+  RadarChart,
+  ResponsiveContainer,
+  Tooltip,
+} from "recharts";
+
+import { DEFAULT_WATCHLIST, SEED_CATALOG } from "@/lib/catalog";
+import {
+  CatalogAnime,
+  FeedbackVote,
+  RecommendationItem,
+  RecommendationResponse,
+  VibeResponse,
+  WATCH_STATUSES,
+  WatchEntry,
+  WatchSignal,
+  WatchStatus,
+} from "@/lib/types";
+
+type TabId = "tracker" | "discover" | "vibe" | "taste";
+
+interface AniListSearchResult {
+  id: number;
+  title: string;
+  genres: string[];
+  episodes: number;
+  synopsis: string;
+  popularity: number;
+  posterColor: string;
+  posterImageUrl: string | null;
+}
+
+interface PersistedState {
+  catalog: CatalogAnime[];
+  watchlist: WatchEntry[];
+  feedback: Record<number, FeedbackVote>;
+}
+
+const STORAGE_KEY = "anivibe-state-v1";
+
+const tabs: Array<{ id: TabId; label: string; icon: React.ReactNode }> = [
+  { id: "tracker", label: "Tracker", icon: <Tv size={16} /> },
+  { id: "discover", label: "Discover", icon: <Compass size={16} /> },
+  { id: "vibe", label: "Vibe Mode", icon: <WandSparkles size={16} /> },
+  { id: "taste", label: "My Taste", icon: <BarChart3 size={16} /> },
+];
+
+const posterGradients = [
+  "linear-gradient(160deg, #1A1F2C 0%, #7B5EFF 100%)",
+  "linear-gradient(160deg, #1A1F2C 0%, #FF458A 100%)",
+  "linear-gradient(160deg, #0F172A 0%, #2563EB 100%)",
+  "linear-gradient(160deg, #111827 0%, #16A34A 100%)",
+  "linear-gradient(160deg, #111827 0%, #B45309 100%)",
+];
+
+const toneBuckets = ["Dark", "Emotional", "Wholesome", "High-energy"];
+
+const normaliseTitle = (title: string) => title.trim().toLowerCase();
+
+const buildPosterStyle = (
+  anime: Pick<CatalogAnime, "posterGradient" | "posterImageUrl">,
+  fallbackGradient?: string,
+) => {
+  if (anime.posterImageUrl) {
+    return {
+      backgroundImage: `linear-gradient(180deg, rgba(10,10,15,0.08) 0%, rgba(10,10,15,0.6) 100%), url('${anime.posterImageUrl}')`,
+      backgroundSize: "cover",
+      backgroundPosition: "top center",
+      backgroundRepeat: "no-repeat",
+    };
+  }
+
+  return {
+    background: fallbackGradient ?? anime.posterGradient,
+  };
+};
+
+const toWatchSignal = (entry: WatchEntry, anime: CatalogAnime | undefined): WatchSignal | null => {
+  if (!anime) return null;
+  return {
+    title: anime.title,
+    status: entry.status,
+    rating: entry.rating,
+    genres: anime.genres,
+    tone: anime.tone,
+    popularity: anime.popularity,
+    complexity: anime.complexity,
+    morality: anime.morality,
+    emotionalIntensity: anime.emotionalIntensity,
+  };
+};
+
+const confidenceClass = {
+  High: "text-emerald-400",
+  Medium: "text-amber-300",
+  Low: "text-zinc-400",
+} as const;
+
+export default function AniVibeApp() {
+  const [activeTab, setActiveTab] = useState<TabId>("tracker");
+  const [catalog, setCatalog] = useState<CatalogAnime[]>(SEED_CATALOG);
+  const [watchlist, setWatchlist] = useState<WatchEntry[]>(
+    DEFAULT_WATCHLIST.map((item) => ({ ...item })),
+  );
+  const [feedback, setFeedback] = useState<Record<number, FeedbackVote>>({});
+
+  const [recommendations, setRecommendations] = useState<RecommendationResponse | null>(null);
+  const [recommendationLoading, setRecommendationLoading] = useState(false);
+
+  const [vibeQuery, setVibeQuery] = useState("");
+  const [vibeResponse, setVibeResponse] = useState<VibeResponse | null>(null);
+  const [vibeLoading, setVibeLoading] = useState(false);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchResults, setSearchResults] = useState<AniListSearchResult[]>([]);
+
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [isHydrated, setIsHydrated] = useState(false);
+  const posterLookupAttemptedRef = useRef(new Set<number>());
+
+  const catalogMap = useMemo(() => {
+    return new Map(catalog.map((item) => [item.id, item]));
+  }, [catalog]);
+
+  const watchSignals = useMemo(() => {
+    return watchlist
+      .map((entry) => toWatchSignal(entry, catalogMap.get(entry.animeId)))
+      .filter((entry): entry is WatchSignal => Boolean(entry));
+  }, [watchlist, catalogMap]);
+
+  const watchlistByStatus = useMemo(() => {
+    return WATCH_STATUSES.map((status) => ({
+      status,
+      items: watchlist.filter((entry) => entry.status === status),
+    }));
+  }, [watchlist]);
+
+  const profileSummary = useMemo(() => {
+    const weightedEntries = watchSignals.map((item) => ({
+      item,
+      weight: item.rating ? item.rating / 2 : item.status === "Completed" ? 3 : 1,
+    }));
+
+    const genreScores = new Map<string, number>();
+    const toneScores = new Map<string, number>();
+
+    for (const { item, weight } of weightedEntries) {
+      for (const genre of item.genres) {
+        genreScores.set(genre, (genreScores.get(genre) ?? 0) + weight);
+      }
+      for (const tone of item.tone) {
+        toneScores.set(tone, (toneScores.get(tone) ?? 0) + weight);
+      }
+    }
+
+    const topGenres = [...genreScores.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([genre, value]) => ({ genre, value: Math.round(value * 10) / 10 }));
+
+    const toneBase = toneBuckets.map((bucket) => ({ bucket, value: 0 }));
+    for (const [tone, value] of toneScores.entries()) {
+      const bucket = toneBuckets.find((target) => tone.toLowerCase().includes(target.toLowerCase()));
+      if (bucket) {
+        const target = toneBase.find((row) => row.bucket === bucket);
+        if (target) target.value += value;
+      } else {
+        const energetic = toneBase.find((row) => row.bucket === "High-energy");
+        if (energetic) energetic.value += value * 0.35;
+      }
+    }
+
+    const toneTotal = toneBase.reduce((sum, row) => sum + row.value, 0) || 1;
+    const toneDistribution = toneBase.map((row) => ({
+      name: row.bucket,
+      value: Math.round((row.value / toneTotal) * 100),
+    }));
+
+    const weightedAverage = (
+      selector: (signal: WatchSignal) => number,
+      defaultValue: number,
+    ) => {
+      if (!weightedEntries.length) return defaultValue;
+      const weightedSum = weightedEntries.reduce((sum, row) => sum + selector(row.item) * row.weight, 0);
+      const weightTotal = weightedEntries.reduce((sum, row) => sum + row.weight, 0) || 1;
+      return Math.round((weightedSum / weightTotal) * 10) / 10;
+    };
+
+    const complexity = weightedAverage((item) => item.complexity, 6.5);
+    const morality = weightedAverage((item) => item.morality, 6.5);
+    const emotionalIntensity = weightedAverage((item) => item.emotionalIntensity, 6.5);
+
+    const narrativeSummary =
+      complexity >= 7.5
+        ? "You gravitate toward layered narratives with strategic or psychological complexity."
+        : "You prefer balanced pacing and accessible storytelling with clear momentum.";
+
+    const moralitySummary =
+      morality >= 7.5
+        ? "Morally gray systems and conflicted protagonists are strong signals in your profile."
+        : "You lean toward cleaner value systems and emotionally direct character journeys.";
+
+    const emotionSummary =
+      emotionalIntensity >= 7.5
+        ? "You consistently choose high emotional-intensity stories over purely casual watches."
+        : "You keep a mixed emotional profile with room for lighter, low-pressure titles.";
+
+    return {
+      topGenres,
+      toneDistribution,
+      complexity,
+      morality,
+      emotionalIntensity,
+      narrativeSummary,
+      moralitySummary,
+      emotionSummary,
+    };
+  }, [watchSignals]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<PersistedState>;
+        if (parsed.catalog?.length) setCatalog(parsed.catalog);
+        if (parsed.watchlist?.length) setWatchlist(parsed.watchlist);
+        if (parsed.feedback) setFeedback(parsed.feedback);
+      }
+    } catch {
+      setStatusMessage("Could not restore prior local state. Using fresh defaults.");
+    } finally {
+      setIsHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+    const value: PersistedState = { catalog, watchlist, feedback };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+  }, [catalog, watchlist, feedback, isHydrated]);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+
+    const candidates = catalog
+      .filter(
+        (anime) =>
+          !anime.posterImageUrl &&
+          !posterLookupAttemptedRef.current.has(anime.id),
+      )
+      .slice(0, 8);
+
+    if (!candidates.length) return;
+
+    for (const anime of candidates) {
+      posterLookupAttemptedRef.current.add(anime.id);
+    }
+
+    let cancelled = false;
+
+    const enrichMissingPosters = async () => {
+      const posterResults = await Promise.all(
+        candidates.map(async (anime) => {
+          try {
+            const response = await fetch(
+              `/api/anilist/search?q=${encodeURIComponent(anime.title)}`,
+            );
+
+            if (!response.ok) return null;
+
+            const payload = (await response.json()) as {
+              items?: AniListSearchResult[];
+            };
+
+            const results = payload.items ?? [];
+            const exactMatch = results.find(
+              (item) => normaliseTitle(item.title) === normaliseTitle(anime.title),
+            );
+            const bestMatch = exactMatch ?? results[0];
+
+            if (!bestMatch?.posterImageUrl) return null;
+
+            return {
+              animeId: anime.id,
+              posterImageUrl: bestMatch.posterImageUrl,
+              posterColor: bestMatch.posterColor,
+            };
+          } catch {
+            return null;
+          }
+        }),
+      );
+
+      if (cancelled) return;
+
+      const updates = posterResults.filter(
+        (result): result is NonNullable<typeof result> => Boolean(result),
+      );
+
+      if (!updates.length) return;
+
+      setCatalog((current) =>
+        current.map((anime) => {
+          const update = updates.find((item) => item.animeId === anime.id);
+          if (!update) return anime;
+
+          return {
+            ...anime,
+            posterImageUrl: update.posterImageUrl,
+            posterGradient: anime.posterGradient.includes("linear-gradient")
+              ? anime.posterGradient
+              : `linear-gradient(160deg, ${update.posterColor || "#7B5EFF"} 0%, #0A0A0F 100%)`,
+          };
+        }),
+      );
+    };
+
+    void enrichMissingPosters();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [catalog, isHydrated]);
+
+  const setEntryPatch = (animeId: number, patch: Partial<WatchEntry>) => {
+    setWatchlist((current) =>
+      current.map((entry) =>
+        entry.animeId === animeId
+          ? {
+              ...entry,
+              ...patch,
+            }
+          : entry,
+      ),
+    );
+  };
+
+  const addCatalogAnime = (input: AniListSearchResult) => {
+    setCatalog((current) => {
+      if (current.some((anime) => anime.id === input.id)) return current;
+      return [
+        {
+          id: input.id,
+          title: input.title,
+          genres: input.genres.length ? input.genres : ["Drama"],
+          tone: ["Emotional", "Reflective"],
+          synopsis: input.synopsis,
+          episodes: input.episodes || 12,
+          popularity: Math.min(100, Math.max(30, input.popularity || 60)),
+          complexity: 6.5,
+          morality: 6.5,
+          emotionalIntensity: 7,
+          posterGradient: `linear-gradient(160deg, ${input.posterColor || "#7B5EFF"} 0%, #0A0A0F 100%)`,
+          posterImageUrl: input.posterImageUrl ?? undefined,
+        },
+        ...current,
+      ];
+    });
+  };
+
+  const addToWatchlist = (animeId: number, status: WatchStatus = "Plan-to-Watch") => {
+    setWatchlist((current) => {
+      if (current.some((entry) => entry.animeId === animeId)) {
+        setStatusMessage("Anime already exists in your lists.");
+        return current;
+      }
+      setStatusMessage("Anime added to your tracking list.");
+      return [
+        { animeId, status, progress: 0, rating: null, review: "" },
+        ...current,
+      ];
+    });
+  };
+
+  const removeFromWatchlist = (animeId: number) => {
+    setWatchlist((current) => current.filter((entry) => entry.animeId !== animeId));
+  };
+
+  const searchAniList = async () => {
+    if (!searchQuery.trim()) return;
+
+    setSearchLoading(true);
+    setStatusMessage(null);
+
+    try {
+      const response = await fetch(`/api/anilist/search?q=${encodeURIComponent(searchQuery.trim())}`);
+      const payload = (await response.json()) as { items?: AniListSearchResult[]; error?: string };
+
+      if (!response.ok) {
+        setStatusMessage(payload.error ?? "AniList search failed.");
+        setSearchResults([]);
+        return;
+      }
+
+      setSearchResults(payload.items ?? []);
+      if (!(payload.items ?? []).length) {
+        setStatusMessage("No matches found for that title.");
+      }
+    } catch {
+      setStatusMessage("AniList is temporarily unreachable. Try again in a moment.");
+      setSearchResults([]);
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
+  const generateRecommendations = async () => {
+    setRecommendationLoading(true);
+    setStatusMessage(null);
+
+    try {
+      const response = await fetch("/api/gemini/recommendations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ history: watchSignals, feedback }),
+      });
+
+      const payload = (await response.json()) as RecommendationResponse;
+      setRecommendations(payload);
+    } catch {
+      setStatusMessage("Recommendation generation failed. Please retry.");
+    } finally {
+      setRecommendationLoading(false);
+    }
+  };
+
+  const runVibeMode = async () => {
+    if (!vibeQuery.trim()) {
+      setStatusMessage("Enter a vibe prompt first (e.g. sad but beautiful).\n");
+      return;
+    }
+
+    setVibeLoading(true);
+    setStatusMessage(null);
+
+    try {
+      const response = await fetch("/api/gemini/vibe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: vibeQuery.trim(), history: watchSignals }),
+      });
+
+      const payload = (await response.json()) as VibeResponse | { error: string };
+      if (!response.ok || "error" in payload) {
+        setStatusMessage("Vibe request failed. Please adjust your prompt and retry.");
+        return;
+      }
+      setVibeResponse(payload);
+    } catch {
+      setStatusMessage("Vibe Mode request failed. Please retry.");
+    } finally {
+      setVibeLoading(false);
+    }
+  };
+
+  const applyFeedback = (animeId: number, vote: FeedbackVote) => {
+    setFeedback((current) => ({ ...current, [animeId]: vote }));
+  };
+
+  const ensureRecommendationTracked = (item: RecommendationItem) => {
+    const existing = catalog.find((anime) => normaliseTitle(anime.title) === normaliseTitle(item.title));
+    const animeId = existing?.id ?? item.id;
+
+    if (!existing) {
+      setCatalog((current) => [
+        {
+          id: animeId,
+          title: item.title,
+          genres: item.genres.length ? item.genres : ["Drama"],
+          tone: item.tone.length ? item.tone : ["Emotional"],
+          synopsis: item.reason,
+          episodes: 12,
+          popularity: item.hiddenGem ? 45 : 70,
+          complexity: 7,
+          morality: 7,
+          emotionalIntensity: 7,
+          posterGradient: posterGradients[Math.abs(animeId) % posterGradients.length],
+        },
+        ...current,
+      ]);
+    }
+
+    addToWatchlist(animeId, "Plan-to-Watch");
+  };
+
+  return (
+    <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
+      <header className="border-b border-white/10 px-4 py-4 md:px-8">
+        <div className="mx-auto flex w-full max-w-7xl items-center justify-between">
+          <div>
+            <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">AniVibe</p>
+            <h1 className="text-2xl font-bold md:text-3xl">Track. Discover. Understand your anime taste.</h1>
+            <p className="text-sm text-[var(--muted)]">Dark-mode first anime tracker powered by Gemini-ready recommendation routes.</p>
+          </div>
+          <div className="hidden rounded-xl border border-white/15 bg-[var(--surface)] px-4 py-2 text-xs text-[var(--muted)] md:block">
+            Gemini key: {process.env.NEXT_PUBLIC_GEMINI_READY ?? "Set in .env.local"}
+          </div>
+        </div>
+      </header>
+
+      <nav className="mx-auto mt-4 grid w-full max-w-7xl grid-cols-2 gap-2 px-4 md:grid-cols-4 md:px-8">
+        {tabs.map((tab) => {
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex items-center justify-center gap-2 rounded-xl border px-4 py-3 text-sm transition ${
+                isActive
+                  ? "border-[var(--accent)] bg-[var(--surface)] text-white"
+                  : "border-white/10 bg-[var(--surface)]/60 text-[var(--muted)] hover:border-white/25"
+              }`}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          );
+        })}
+      </nav>
+
+      {statusMessage ? (
+        <p className="mx-auto mt-3 w-full max-w-7xl rounded-lg border border-[var(--accent)]/30 bg-[var(--surface)] px-4 py-2 text-sm text-[var(--muted)]">
+          {statusMessage}
+        </p>
+      ) : null}
+
+      <main className="mx-auto w-full max-w-7xl px-4 py-6 md:px-8 md:py-8">
+        {activeTab === "tracker" ? (
+          <section className="space-y-6">
+            <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4 md:p-6">
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <h2 className="text-lg font-semibold">Smart Anime Tracking</h2>
+                <p className="text-xs text-[var(--muted)]">Watching · Completed · On-Hold · Plan-to-Watch</p>
+              </div>
+
+              <div className="flex flex-col gap-3 md:flex-row">
+                <div className="flex flex-1 items-center gap-2 rounded-xl border border-white/10 bg-[var(--bg)] px-3">
+                  <Search size={16} className="text-[var(--muted)]" />
+                  <input
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    placeholder="Search anime on AniList"
+                    className="h-11 w-full bg-transparent text-sm outline-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={searchAniList}
+                  disabled={searchLoading}
+                  className="h-11 rounded-xl bg-[var(--accent)] px-4 text-sm font-medium text-white transition hover:opacity-90 disabled:opacity-60"
+                >
+                  {searchLoading ? "Searching..." : "Search & Add"}
+                </button>
+              </div>
+
+              {searchResults.length ? (
+                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                  {searchResults.map((result) => (
+                    <div key={result.id} className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <div
+                        className="mb-2 h-44 rounded-lg md:h-52"
+                        style={
+                          result.posterImageUrl
+                            ? {
+                                backgroundImage: `linear-gradient(180deg, rgba(10,10,15,0.08) 0%, rgba(10,10,15,0.5) 100%), url('${result.posterImageUrl}')`,
+                                backgroundSize: "cover",
+                                backgroundPosition: "top center",
+                                backgroundRepeat: "no-repeat",
+                              }
+                            : {
+                                background: `linear-gradient(160deg, ${result.posterColor || "#7B5EFF"} 0%, #0A0A0F 100%)`,
+                              }
+                        }
+                      />
+                      <p className="font-medium">{result.title}</p>
+                      <p className="line-clamp-2 text-xs text-[var(--muted)]">{result.synopsis}</p>
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {result.genres.slice(0, 3).map((genre) => (
+                          <span key={genre} className="rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-[var(--muted)]">
+                            {genre}
+                          </span>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          addCatalogAnime(result);
+                          addToWatchlist(result.id);
+                        }}
+                        className="mt-3 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-xs font-medium text-white"
+                      >
+                        Add to Plan-to-Watch
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              {watchlistByStatus.map((group) => (
+                <div key={group.status} className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h3 className="font-semibold">{group.status}</h3>
+                    <span className="rounded-full border border-white/10 px-2 py-0.5 text-xs text-[var(--muted)]">
+                      {group.items.length}
+                    </span>
+                  </div>
+
+                  <div className="space-y-3">
+                    {group.items.length === 0 ? (
+                      <p className="text-xs text-[var(--muted)]">No titles yet.</p>
+                    ) : (
+                      group.items.map((entry) => {
+                        const anime = catalogMap.get(entry.animeId);
+                        if (!anime) return null;
+
+                        return (
+                          <article key={entry.animeId} className="overflow-hidden rounded-xl border border-white/10 bg-black/30">
+                            <div className="h-44 md:h-56" style={buildPosterStyle(anime)} />
+                            <div className="space-y-2 p-3">
+                              <p className="text-sm font-semibold leading-tight">{anime.title}</p>
+                              <p className="text-xs text-[var(--muted)]">
+                                {entry.progress}/{anime.episodes} episodes
+                              </p>
+
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={anime.episodes}
+                                  value={entry.progress}
+                                  onChange={(event) =>
+                                    setEntryPatch(entry.animeId, {
+                                      progress: Math.max(0, Number(event.target.value) || 0),
+                                    })
+                                  }
+                                  className="h-8 w-20 rounded-md border border-white/15 bg-[var(--bg)] px-2 text-xs outline-none"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setEntryPatch(entry.animeId, {
+                                      progress: Math.min(anime.episodes, entry.progress + 1),
+                                    })
+                                  }
+                                  className="h-8 rounded-md border border-white/15 px-2 text-xs text-[var(--muted)]"
+                                >
+                                  +1 EP
+                                </button>
+                              </div>
+
+                              <select
+                                value={entry.status}
+                                onChange={(event) =>
+                                  setEntryPatch(entry.animeId, {
+                                    status: event.target.value as WatchStatus,
+                                  })
+                                }
+                                className="h-8 w-full rounded-md border border-white/15 bg-[var(--bg)] px-2 text-xs outline-none"
+                              >
+                                {WATCH_STATUSES.map((status) => (
+                                  <option key={status} value={status}>
+                                    {status}
+                                  </option>
+                                ))}
+                              </select>
+
+                              {entry.status === "Completed" ? (
+                                <>
+                                  <label className="flex items-center justify-between text-xs text-[var(--muted)]">
+                                    Rating
+                                    <span>{entry.rating ?? 0}/10</span>
+                                  </label>
+                                  <input
+                                    type="range"
+                                    min={1}
+                                    max={10}
+                                    value={entry.rating ?? 7}
+                                    onChange={(event) =>
+                                      setEntryPatch(entry.animeId, {
+                                        rating: Number(event.target.value),
+                                      })
+                                    }
+                                    className="w-full accent-[var(--accent)]"
+                                  />
+                                  <textarea
+                                    value={entry.review}
+                                    onChange={(event) =>
+                                      setEntryPatch(entry.animeId, {
+                                        review: event.target.value,
+                                      })
+                                    }
+                                    placeholder="Quick review..."
+                                    rows={2}
+                                    className="w-full rounded-md border border-white/15 bg-[var(--bg)] p-2 text-xs outline-none"
+                                  />
+                                </>
+                              ) : null}
+
+                              <button
+                                type="button"
+                                onClick={() => removeFromWatchlist(entry.animeId)}
+                                className="w-full rounded-md border border-red-300/30 bg-red-950/20 py-1.5 text-xs text-red-200"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          </article>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        {activeTab === "discover" ? (
+          <section className="space-y-4">
+            <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-5">
+              <h2 className="text-lg font-semibold">AI-Powered Recommendations</h2>
+              <p className="mt-1 text-sm text-[var(--muted)]">
+                Generates 10 profile-aware picks with rationale and hidden gem prioritization.
+              </p>
+              <button
+                type="button"
+                onClick={generateRecommendations}
+                disabled={recommendationLoading}
+                className="mt-4 inline-flex h-11 items-center gap-2 rounded-xl bg-[var(--accent)] px-4 text-sm font-medium text-white transition hover:opacity-90 disabled:opacity-60"
+              >
+                <Sparkles size={16} />
+                {recommendationLoading ? "Analyzing profile..." : "Generate Top Picks"}
+              </button>
+            </div>
+
+            {recommendations ? (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-xs text-[var(--muted)]">
+                  <span>Source: {recommendations.source === "gemini" ? "Gemini" : "Fallback"}</span>
+                  <span>Latency: {recommendations.latencyMs}ms</span>
+                </div>
+
+                <div className="grid gap-4 md:grid-cols-2">
+                  {recommendations.items.map((item) => {
+                    const linkedAnime = catalog.find(
+                      (anime) => normaliseTitle(anime.title) === normaliseTitle(item.title),
+                    );
+
+                    return (
+                      <article key={`${item.id}-${item.title}`} className="overflow-hidden rounded-xl border border-white/10 bg-[var(--surface)]">
+                        <div
+                          className="h-44 md:h-56"
+                          style={
+                            linkedAnime
+                              ? buildPosterStyle(
+                                  linkedAnime,
+                                  posterGradients[Math.abs(item.id) % posterGradients.length],
+                                )
+                              : {
+                                  background:
+                                    posterGradients[Math.abs(item.id) % posterGradients.length],
+                                }
+                          }
+                        />
+                        <div className="space-y-3 p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <h3 className="text-base font-semibold">{item.title}</h3>
+                            <span className={`text-xs font-medium ${confidenceClass[item.confidence]}`}>
+                              {item.confidence}
+                            </span>
+                          </div>
+
+                          <p className="text-sm text-[var(--muted)]">{item.reason}</p>
+
+                          <div className="flex flex-wrap gap-1">
+                            {item.genres.slice(0, 2).map((genre) => (
+                              <span key={genre} className="rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-[var(--muted)]">
+                                {genre}
+                              </span>
+                            ))}
+                            {item.hiddenGem ? (
+                              <span className="rounded-full border border-[var(--secondary)]/40 bg-[var(--secondary)]/15 px-2 py-0.5 text-[11px] text-violet-200">
+                                Hidden Gem
+                              </span>
+                            ) : null}
+                          </div>
+
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => applyFeedback(item.id, "like")}
+                              className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs ${
+                                feedback[item.id] === "like"
+                                  ? "border-emerald-400/60 bg-emerald-500/20 text-emerald-200"
+                                  : "border-white/15 text-[var(--muted)]"
+                              }`}
+                            >
+                              <ThumbsUp size={14} />
+                              Like
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => applyFeedback(item.id, "dislike")}
+                              className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs ${
+                                feedback[item.id] === "dislike"
+                                  ? "border-red-400/60 bg-red-500/20 text-red-200"
+                                  : "border-white/15 text-[var(--muted)]"
+                              }`}
+                            >
+                              <ThumbsDown size={14} />
+                              Dislike
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => ensureRecommendationTracked(item)}
+                              className="inline-flex items-center gap-1 rounded-md border border-[var(--secondary)]/40 bg-[var(--secondary)]/15 px-2.5 py-1.5 text-xs text-violet-200"
+                            >
+                              + Add to List
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
+
+        {activeTab === "vibe" ? (
+          <section className="space-y-4">
+            <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-5">
+              <h2 className="text-lg font-semibold">Vibe Mode</h2>
+              <p className="mt-1 text-sm text-[var(--muted)]">
+                Describe the mood you want and get a curated list instantly.
+              </p>
+
+              <div className="mt-4 flex flex-col gap-3 md:flex-row">
+                <input
+                  value={vibeQuery}
+                  onChange={(event) => setVibeQuery(event.target.value)}
+                  placeholder="e.g. Something like Attack on Titan but less action and more psychological"
+                  className="h-12 flex-1 rounded-xl border border-[var(--secondary)]/35 bg-[var(--bg)] px-4 text-sm outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={runVibeMode}
+                  disabled={vibeLoading}
+                  className="h-12 rounded-xl bg-[var(--secondary)] px-5 text-sm font-semibold text-white transition hover:opacity-90 disabled:opacity-60"
+                >
+                  {vibeLoading ? "Generating..." : "Generate Watchlist"}
+                </button>
+              </div>
+            </div>
+
+            {vibeResponse ? (
+              <div className="space-y-3">
+                <div className="rounded-xl border border-white/10 bg-[var(--surface)] p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-[var(--muted)]">
+                    <span>Source: {vibeResponse.source === "gemini" ? "Gemini" : "Fallback"}</span>
+                    <span>Latency: {vibeResponse.latencyMs}ms</span>
+                  </div>
+                  <p className="mt-2 text-sm text-white">{vibeResponse.vibeSummary}</p>
+                </div>
+
+                <div className="grid gap-4 md:grid-cols-2">
+                  {vibeResponse.items.map((item) => {
+                    const linkedAnime = catalog.find(
+                      (anime) => normaliseTitle(anime.title) === normaliseTitle(item.title),
+                    );
+
+                    return (
+                    <article key={`${item.id}-${item.title}`} className="overflow-hidden rounded-xl border border-white/10 bg-[var(--surface)]">
+                      <div
+                        className="h-44 md:h-52"
+                        style={
+                          linkedAnime
+                            ? buildPosterStyle(
+                                linkedAnime,
+                                posterGradients[Math.abs(item.id) % posterGradients.length],
+                              )
+                            : {
+                                background:
+                                  posterGradients[Math.abs(item.id) % posterGradients.length],
+                              }
+                        }
+                      />
+                      <div className="p-4">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <h3 className="font-semibold">{item.title}</h3>
+                        <span className={`text-xs ${confidenceClass[item.confidence]}`}>{item.confidence}</span>
+                      </div>
+                      <p className="text-sm text-[var(--muted)]">{item.reason}</p>
+                      <div className="mt-3 flex flex-wrap gap-1">
+                        {item.tone.slice(0, 3).map((tone) => (
+                          <span key={tone} className="rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-[var(--muted)]">
+                            {tone}
+                          </span>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => ensureRecommendationTracked(item)}
+                        className="mt-3 rounded-md bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-white"
+                      >
+                        Add to Plan-to-Watch
+                      </button>
+                      </div>
+                    </article>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
+
+        {activeTab === "taste" ? (
+          <section className="space-y-4">
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
+                <p className="text-xs uppercase tracking-wider text-[var(--muted)]">Narrative Complexity</p>
+                <p className="mt-2 text-2xl font-bold text-white">{profileSummary.complexity}/10</p>
+                <p className="mt-2 text-sm text-[var(--muted)]">{profileSummary.narrativeSummary}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
+                <p className="text-xs uppercase tracking-wider text-[var(--muted)]">Morality Spectrum</p>
+                <p className="mt-2 text-2xl font-bold text-white">{profileSummary.morality}/10</p>
+                <p className="mt-2 text-sm text-[var(--muted)]">{profileSummary.moralitySummary}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
+                <p className="text-xs uppercase tracking-wider text-[var(--muted)]">Emotional Intensity</p>
+                <p className="mt-2 text-2xl font-bold text-white">{profileSummary.emotionalIntensity}/10</p>
+                <p className="mt-2 text-sm text-[var(--muted)]">{profileSummary.emotionSummary}</p>
+              </div>
+            </div>
+
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
+                <h3 className="text-sm font-semibold">Dominant Genres</h3>
+                <div className="mt-3 h-72">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <RadarChart data={profileSummary.topGenres.map((item) => ({ subject: item.genre, A: item.value }))}>
+                      <PolarGrid stroke="rgba(255,255,255,0.12)" />
+                      <PolarAngleAxis dataKey="subject" tick={{ fill: "#A0A0C4", fontSize: 12 }} />
+                      <Radar
+                        name="Genre"
+                        dataKey="A"
+                        stroke="#FF458A"
+                        fill="#FF458A"
+                        fillOpacity={0.5}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          background: "#1A1F2C",
+                          border: "1px solid rgba(255,255,255,0.15)",
+                          borderRadius: 8,
+                          color: "#FFFFFF",
+                        }}
+                      />
+                    </RadarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
+                <h3 className="text-sm font-semibold">Tone Distribution</h3>
+                <div className="mt-3 h-72">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={profileSummary.toneDistribution}
+                        dataKey="value"
+                        nameKey="name"
+                        innerRadius={60}
+                        outerRadius={96}
+                        paddingAngle={2}
+                      >
+                        {profileSummary.toneDistribution.map((entry) => (
+                          <Cell
+                            key={entry.name}
+                            fill={
+                              entry.name === "Dark"
+                                ? "#FF458A"
+                                : entry.name === "Emotional"
+                                  ? "#7B5EFF"
+                                  : entry.name === "Wholesome"
+                                    ? "#4CAF50"
+                                    : "#FFC107"
+                            }
+                          />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        contentStyle={{
+                          background: "#1A1F2C",
+                          border: "1px solid rgba(255,255,255,0.15)",
+                          borderRadius: 8,
+                          color: "#FFFFFF",
+                        }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs text-[var(--muted)]">
+                  {profileSummary.toneDistribution.map((entry) => (
+                    <div key={entry.name} className="rounded-md border border-white/10 px-2 py-1">
+                      {entry.name}: {entry.value}%
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-[var(--accent)]/35 bg-[var(--surface)] p-4">
+              <p className="inline-flex items-center gap-2 text-sm font-medium text-white">
+                <Heart size={16} className="text-[var(--accent)]" />
+                AniVibe Insight Narrative
+              </p>
+              <p className="mt-2 text-sm text-[var(--muted)]">
+                Your profile favors {profileSummary.topGenres.slice(0, 2).map((item) => item.genre).join(" and ")} stories with
+                {" "}
+                {profileSummary.complexity >= 7 ? "high structural depth" : "balanced pacing"}. You respond strongly to
+                {" "}
+                {profileSummary.toneDistribution[0]?.name.toLowerCase() ?? "mixed"} tones and character-driven emotional arcs.
+              </p>
+            </div>
+          </section>
+        ) : null}
+      </main>
+    </div>
+  );
+}
