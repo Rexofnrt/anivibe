@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 const query = `
   query ($search: String) {
-    Page(page: 1, perPage: 8) {
+    Page(page: 1, perPage: 50) {
       media(search: $search, type: ANIME, sort: POPULARITY_DESC) {
         id
         title {

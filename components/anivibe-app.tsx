@@ -57,6 +57,8 @@ interface PersistedState {
 }
 
 const STORAGE_KEY = "anivibe-state-v1";
+const WATCHLIST_PAGE_SIZE = 2;
+const SEARCH_RESULTS_PAGE_SIZE = 9;
 
 const tabs: Array<{ id: TabId; label: string; icon: React.ReactNode }> = [
   { id: "tracker", label: "Tracker", icon: <Tv size={16} /> },
@@ -80,12 +82,14 @@ const normaliseTitle = (title: string) => title.trim().toLowerCase();
 const buildPosterStyle = (
   anime: Pick<CatalogAnime, "posterGradient" | "posterImageUrl">,
   fallbackGradient?: string,
+  fit: "contain" | "cover" = "contain",
 ) => {
   if (anime.posterImageUrl) {
     return {
-      backgroundImage: `linear-gradient(180deg, rgba(10,10,15,0.08) 0%, rgba(10,10,15,0.6) 100%), url('${anime.posterImageUrl}')`,
-      backgroundSize: "cover",
-      backgroundPosition: "top center",
+      backgroundImage: `url('${anime.posterImageUrl}')`,
+      backgroundColor: "#0A0A0F",
+      backgroundSize: fit,
+      backgroundPosition: "center",
       backgroundRepeat: "no-repeat",
     };
   }
@@ -134,10 +138,30 @@ export default function AniVibeApp() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchResults, setSearchResults] = useState<AniListSearchResult[]>([]);
+  const [searchResultsPage, setSearchResultsPage] = useState(1);
+  const [searchSuggestions, setSearchSuggestions] = useState<
+    AniListSearchResult[]
+  >([]);
+  const [searchSuggestionsLoading, setSearchSuggestionsLoading] =
+    useState(false);
+  const [showSearchSuggestions, setShowSearchSuggestions] = useState(false);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
+  const [watchlistPageByStatus, setWatchlistPageByStatus] = useState<
+    Record<WatchStatus, number>
+  >(() =>
+    WATCH_STATUSES.reduce(
+      (accumulator, status) => ({
+        ...accumulator,
+        [status]: 1,
+      }),
+      {} as Record<WatchStatus, number>,
+    ),
+  );
 
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isHydrated, setIsHydrated] = useState(false);
   const posterLookupAttemptedRef = useRef(new Set<number>());
+  const searchBoxRef = useRef<HTMLDivElement | null>(null);
 
   const catalogMap = useMemo(() => {
     return new Map(catalog.map((item) => [item.id, item]));
@@ -149,12 +173,36 @@ export default function AniVibeApp() {
       .filter((entry): entry is WatchSignal => Boolean(entry));
   }, [watchlist, catalogMap]);
 
+  const searchResultsTotalPages = useMemo(
+    () => Math.max(1, Math.ceil(searchResults.length / SEARCH_RESULTS_PAGE_SIZE)),
+    [searchResults.length],
+  );
+
+  const pagedSearchResults = useMemo(() => {
+    const startIndex = (searchResultsPage - 1) * SEARCH_RESULTS_PAGE_SIZE;
+    return searchResults.slice(startIndex, startIndex + SEARCH_RESULTS_PAGE_SIZE);
+  }, [searchResults, searchResultsPage]);
+
   const watchlistByStatus = useMemo(() => {
-    return WATCH_STATUSES.map((status) => ({
-      status,
-      items: watchlist.filter((entry) => entry.status === status),
-    }));
-  }, [watchlist]);
+    return WATCH_STATUSES.map((status) => {
+      const allItems = watchlist.filter((entry) => entry.status === status);
+      const totalItems = allItems.length;
+      const totalPages = Math.max(1, Math.ceil(totalItems / WATCHLIST_PAGE_SIZE));
+      const currentPage = Math.min(
+        watchlistPageByStatus[status] ?? 1,
+        totalPages,
+      );
+      const startIndex = (currentPage - 1) * WATCHLIST_PAGE_SIZE;
+
+      return {
+        status,
+        items: allItems.slice(startIndex, startIndex + WATCHLIST_PAGE_SIZE),
+        totalItems,
+        currentPage,
+        totalPages,
+      };
+    });
+  }, [watchlist, watchlistPageByStatus]);
 
   const profileSummary = useMemo(() => {
     const weightedEntries = watchSignals.map((item) => ({
@@ -259,6 +307,95 @@ export default function AniVibeApp() {
     const value: PersistedState = { catalog, watchlist, feedback };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
   }, [catalog, watchlist, feedback, isHydrated]);
+
+  useEffect(() => {
+    setSearchResultsPage((current) => Math.min(current, searchResultsTotalPages));
+  }, [searchResultsTotalPages]);
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (query.length < 2) {
+      setSearchSuggestions([]);
+      setSearchSuggestionsLoading(false);
+      setActiveSuggestionIndex(-1);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      setSearchSuggestionsLoading(true);
+
+      try {
+        const response = await fetch(
+          `/api/anilist/search?q=${encodeURIComponent(query)}`,
+          { signal: controller.signal },
+        );
+
+        if (!response.ok) {
+          setSearchSuggestions([]);
+          return;
+        }
+
+        const payload = (await response.json()) as {
+          items?: AniListSearchResult[];
+        };
+
+        const nextSuggestions = (payload.items ?? []).slice(0, 8);
+        setSearchSuggestions(nextSuggestions);
+        setActiveSuggestionIndex(nextSuggestions.length ? 0 : -1);
+      } catch {
+        setSearchSuggestions([]);
+        setActiveSuggestionIndex(-1);
+      } finally {
+        setSearchSuggestionsLoading(false);
+      }
+    }, 250);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [searchQuery]);
+
+  useEffect(() => {
+    const handleOutsideClick = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (!searchBoxRef.current?.contains(target)) {
+        setShowSearchSuggestions(false);
+        setActiveSuggestionIndex(-1);
+      }
+    };
+
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+    };
+  }, []);
+
+  useEffect(() => {
+    setWatchlistPageByStatus((current) => {
+      let changed = false;
+      const next = { ...current };
+
+      for (const status of WATCH_STATUSES) {
+        const totalItems = watchlist.filter((entry) => entry.status === status).length;
+        const totalPages = Math.max(1, Math.ceil(totalItems / WATCHLIST_PAGE_SIZE));
+        const currentPage = next[status] ?? 1;
+
+        if (currentPage > totalPages) {
+          next[status] = totalPages;
+          changed = true;
+        }
+
+        if (!next[status]) {
+          next[status] = 1;
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, [watchlist]);
 
   useEffect(() => {
     if (!isHydrated) return;
@@ -397,29 +534,45 @@ export default function AniVibeApp() {
     setWatchlist((current) => current.filter((entry) => entry.animeId !== animeId));
   };
 
-  const searchAniList = async () => {
-    if (!searchQuery.trim()) return;
+  const setWatchlistPage = (status: WatchStatus, page: number) => {
+    setWatchlistPageByStatus((current) => ({
+      ...current,
+      [status]: Math.max(1, page),
+    }));
+  };
+
+  const searchAniList = async (queryOverride?: string) => {
+    const query = (queryOverride ?? searchQuery).trim();
+    if (!query) return;
 
     setSearchLoading(true);
     setStatusMessage(null);
+    setShowSearchSuggestions(false);
+    setActiveSuggestionIndex(-1);
+    if (queryOverride) setSearchQuery(query);
 
     try {
-      const response = await fetch(`/api/anilist/search?q=${encodeURIComponent(searchQuery.trim())}`);
+      const response = await fetch(
+        `/api/anilist/search?q=${encodeURIComponent(query)}`,
+      );
       const payload = (await response.json()) as { items?: AniListSearchResult[]; error?: string };
 
       if (!response.ok) {
         setStatusMessage(payload.error ?? "AniList search failed.");
         setSearchResults([]);
+        setSearchResultsPage(1);
         return;
       }
 
       setSearchResults(payload.items ?? []);
+      setSearchResultsPage(1);
       if (!(payload.items ?? []).length) {
         setStatusMessage("No matches found for that title.");
       }
     } catch {
       setStatusMessage("AniList is temporarily unreachable. Try again in a moment.");
       setSearchResults([]);
+      setSearchResultsPage(1);
     } finally {
       setSearchLoading(false);
     }
@@ -556,18 +709,113 @@ export default function AniVibeApp() {
               </div>
 
               <div className="flex flex-col gap-3 md:flex-row">
-                <div className="flex flex-1 items-center gap-2 rounded-xl border border-white/10 bg-[var(--bg)] px-3">
-                  <Search size={16} className="text-[var(--muted)]" />
-                  <input
-                    value={searchQuery}
-                    onChange={(event) => setSearchQuery(event.target.value)}
-                    placeholder="Search anime on AniList"
-                    className="h-11 w-full bg-transparent text-sm outline-none"
-                  />
+                <div ref={searchBoxRef} className="relative flex-1">
+                  <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-[var(--bg)] px-3">
+                    <Search size={16} className="text-[var(--muted)]" />
+                    <input
+                      value={searchQuery}
+                      onChange={(event) => {
+                        setSearchQuery(event.target.value);
+                        setShowSearchSuggestions(true);
+                        setActiveSuggestionIndex(0);
+                      }}
+                      onFocus={() => {
+                        setShowSearchSuggestions(true);
+                        if (searchSuggestions.length) {
+                          setActiveSuggestionIndex((current) =>
+                            current >= 0 ? current : 0,
+                          );
+                        }
+                      }}
+                      onKeyDown={(event) => {
+                        if (
+                          event.key === "ArrowDown" &&
+                          showSearchSuggestions &&
+                          searchSuggestions.length
+                        ) {
+                          event.preventDefault();
+                          setActiveSuggestionIndex((current) =>
+                            current < searchSuggestions.length - 1 ? current + 1 : 0,
+                          );
+                          return;
+                        }
+
+                        if (
+                          event.key === "ArrowUp" &&
+                          showSearchSuggestions &&
+                          searchSuggestions.length
+                        ) {
+                          event.preventDefault();
+                          setActiveSuggestionIndex((current) =>
+                            current > 0 ? current - 1 : searchSuggestions.length - 1,
+                          );
+                          return;
+                        }
+
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          if (
+                            showSearchSuggestions &&
+                            activeSuggestionIndex >= 0 &&
+                            activeSuggestionIndex < searchSuggestions.length
+                          ) {
+                            void searchAniList(
+                              searchSuggestions[activeSuggestionIndex].title,
+                            );
+                            return;
+                          }
+                          void searchAniList();
+                        }
+                        if (event.key === "Escape") {
+                          setShowSearchSuggestions(false);
+                          setActiveSuggestionIndex(-1);
+                        }
+                      }}
+                      placeholder="Search anime on AniList"
+                      className="h-11 w-full bg-transparent text-sm outline-none"
+                    />
+                  </div>
+
+                  {showSearchSuggestions && searchQuery.trim().length >= 2 ? (
+                    <div className="absolute left-0 right-0 top-full z-20 mt-2 max-h-80 overflow-y-auto rounded-xl border border-white/10 bg-[var(--surface)] p-2 shadow-xl">
+                      {searchSuggestionsLoading ? (
+                        <p className="px-2 py-2 text-xs text-[var(--muted)]">
+                          Loading suggestions...
+                        </p>
+                      ) : searchSuggestions.length ? (
+                        <div className="space-y-1">
+                          {searchSuggestions.map((suggestion, index) => (
+                            <button
+                              key={suggestion.id}
+                              type="button"
+                              onClick={() => void searchAniList(suggestion.title)}
+                              onMouseEnter={() => setActiveSuggestionIndex(index)}
+                              className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition ${
+                                index === activeSuggestionIndex
+                                  ? "bg-white/10"
+                                  : "hover:bg-white/5"
+                              }`}
+                            >
+                              <span className="line-clamp-1 text-sm font-medium text-white">
+                                {suggestion.title}
+                              </span>
+                              <span className="line-clamp-1 text-xs text-[var(--muted)]">
+                                {suggestion.genres.slice(0, 2).join(" • ")}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="px-2 py-2 text-xs text-[var(--muted)]">
+                          No suggestions found.
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
                 <button
                   type="button"
-                  onClick={searchAniList}
+                  onClick={() => void searchAniList()}
                   disabled={searchLoading}
                   className="h-11 rounded-xl bg-[var(--accent)] px-4 text-sm font-medium text-white transition hover:opacity-90 disabled:opacity-60"
                 >
@@ -576,17 +824,19 @@ export default function AniVibeApp() {
               </div>
 
               {searchResults.length ? (
-                <div className="mt-4 grid gap-3 md:grid-cols-2">
-                  {searchResults.map((result) => (
-                    <div key={result.id} className="rounded-xl border border-white/10 bg-black/30 p-3">
+                <>
+                <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                  {pagedSearchResults.map((result) => (
+                    <div key={result.id} className="flex gap-4 rounded-xl border border-white/10 bg-black/30 p-4">
                       <div
-                        className="mb-2 h-44 rounded-lg md:h-52"
+                        className="h-40 w-28 flex-none rounded-lg md:h-44 md:w-32"
                         style={
                           result.posterImageUrl
                             ? {
-                                backgroundImage: `linear-gradient(180deg, rgba(10,10,15,0.08) 0%, rgba(10,10,15,0.5) 100%), url('${result.posterImageUrl}')`,
-                                backgroundSize: "cover",
-                                backgroundPosition: "top center",
+                                backgroundImage: `url('${result.posterImageUrl}')`,
+                                backgroundColor: "#0A0A0F",
+                                backgroundSize: "contain",
+                                backgroundPosition: "center",
                                 backgroundRepeat: "no-repeat",
                               }
                             : {
@@ -594,38 +844,70 @@ export default function AniVibeApp() {
                               }
                         }
                       />
-                      <p className="font-medium">{result.title}</p>
-                      <p className="line-clamp-2 text-xs text-[var(--muted)]">{result.synopsis}</p>
-                      <div className="mt-2 flex flex-wrap gap-1">
-                        {result.genres.slice(0, 3).map((genre) => (
-                          <span key={genre} className="rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-[var(--muted)]">
-                            {genre}
-                          </span>
-                        ))}
+                      <div className="min-w-0 flex-1">
+                        <p className="line-clamp-2 text-base font-semibold leading-tight">{result.title}</p>
+                        <p className="mt-1 line-clamp-3 text-xs text-[var(--muted)]">{result.synopsis}</p>
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {result.genres.slice(0, 2).map((genre) => (
+                            <span key={genre} className="rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-[var(--muted)]">
+                              {genre}
+                            </span>
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            addCatalogAnime(result);
+                            addToWatchlist(result.id);
+                          }}
+                          className="mt-3 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-xs font-medium text-white"
+                        >
+                          Add to Plan-to-Watch
+                        </button>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          addCatalogAnime(result);
-                          addToWatchlist(result.id);
-                        }}
-                        className="mt-3 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-xs font-medium text-white"
-                      >
-                        Add to Plan-to-Watch
-                      </button>
                     </div>
                   ))}
                 </div>
+                {searchResultsTotalPages > 1 ? (
+                  <div className="mt-4 flex items-center justify-between">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSearchResultsPage((current) => Math.max(1, current - 1))
+                      }
+                      disabled={searchResultsPage === 1}
+                      className="h-9 rounded-md border border-white/15 px-3 text-xs text-[var(--muted)] disabled:opacity-40"
+                    >
+                      Prev
+                    </button>
+                    <p className="text-xs text-[var(--muted)]">
+                      Search Page {searchResultsPage} / {searchResultsTotalPages}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSearchResultsPage((current) =>
+                          Math.min(searchResultsTotalPages, current + 1),
+                        )
+                      }
+                      disabled={searchResultsPage >= searchResultsTotalPages}
+                      className="h-9 rounded-md border border-white/15 px-3 text-xs text-[var(--muted)] disabled:opacity-40"
+                    >
+                      Next
+                    </button>
+                  </div>
+                ) : null}
+                </>
               ) : null}
             </div>
 
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               {watchlistByStatus.map((group) => (
-                <div key={group.status} className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
+                <div key={group.status} className="rounded-2xl border border-white/10 bg-[var(--surface)] p-5">
                   <div className="mb-3 flex items-center justify-between">
                     <h3 className="font-semibold">{group.status}</h3>
                     <span className="rounded-full border border-white/10 px-2 py-0.5 text-xs text-[var(--muted)]">
-                      {group.items.length}
+                      {group.totalItems}
                     </span>
                   </div>
 
@@ -639,8 +921,11 @@ export default function AniVibeApp() {
 
                         return (
                           <article key={entry.animeId} className="overflow-hidden rounded-xl border border-white/10 bg-black/30">
-                            <div className="h-44 md:h-56" style={buildPosterStyle(anime)} />
-                            <div className="space-y-2 p-3">
+                            <div
+                              className="aspect-[2/3] w-full border-b border-white/10"
+                              style={buildPosterStyle(anime, undefined, "cover")}
+                            />
+                            <div className="space-y-2 p-3 md:p-4">
                               <p className="text-sm font-semibold leading-tight">{anime.title}</p>
                               <p className="text-xs text-[var(--muted)]">
                                 {entry.progress}/{anime.episodes} episodes
@@ -733,6 +1018,34 @@ export default function AniVibeApp() {
                       })
                     )}
                   </div>
+
+                  {group.totalItems > 0 && group.totalPages > 1 ? (
+                    <div className="mt-3 flex items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setWatchlistPage(group.status, group.currentPage - 1)
+                        }
+                        disabled={group.currentPage === 1}
+                        className="h-8 rounded-md border border-white/15 px-3 text-xs text-[var(--muted)] disabled:opacity-40"
+                      >
+                        Prev
+                      </button>
+                      <p className="text-xs text-[var(--muted)]">
+                        Page {group.currentPage} / {group.totalPages}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setWatchlistPage(group.status, Math.min(group.totalPages, group.currentPage + 1))
+                        }
+                        disabled={group.currentPage >= group.totalPages}
+                        className="h-8 rounded-md border border-white/15 px-3 text-xs text-[var(--muted)] disabled:opacity-40"
+                      >
+                        Next
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -771,14 +1084,15 @@ export default function AniVibeApp() {
                     );
 
                     return (
-                      <article key={`${item.id}-${item.title}`} className="overflow-hidden rounded-xl border border-white/10 bg-[var(--surface)]">
+                      <article key={`${item.id}-${item.title}`} className="flex gap-4 rounded-xl border border-white/10 bg-[var(--surface)] p-4">
                         <div
-                          className="h-44 md:h-56"
+                          className="h-40 w-28 flex-none rounded-lg md:h-44 md:w-32"
                           style={
                             linkedAnime
                               ? buildPosterStyle(
                                   linkedAnime,
                                   posterGradients[Math.abs(item.id) % posterGradients.length],
+                                  "cover",
                                 )
                               : {
                                   background:
@@ -786,7 +1100,7 @@ export default function AniVibeApp() {
                                 }
                           }
                         />
-                        <div className="space-y-3 p-4">
+                        <div className="min-w-0 space-y-3">
                           <div className="flex items-center justify-between gap-3">
                             <h3 className="text-base font-semibold">{item.title}</h3>
                             <span className={`text-xs font-medium ${confidenceClass[item.confidence]}`}>
@@ -794,7 +1108,7 @@ export default function AniVibeApp() {
                             </span>
                           </div>
 
-                          <p className="text-sm text-[var(--muted)]">{item.reason}</p>
+                          <p className="line-clamp-4 text-sm text-[var(--muted)]">{item.reason}</p>
 
                           <div className="flex flex-wrap gap-1">
                             {item.genres.slice(0, 2).map((genre) => (
@@ -897,7 +1211,7 @@ export default function AniVibeApp() {
                     return (
                     <article key={`${item.id}-${item.title}`} className="overflow-hidden rounded-xl border border-white/10 bg-[var(--surface)]">
                       <div
-                        className="h-44 md:h-52"
+                        className="h-32 md:h-40"
                         style={
                           linkedAnime
                             ? buildPosterStyle(
