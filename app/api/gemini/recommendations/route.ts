@@ -9,6 +9,39 @@ interface RequestBody {
   feedback?: Record<number, "like" | "dislike">;
 }
 
+const buildFallbackPayload = ({
+  startedAt,
+  history,
+  feedback,
+  reason,
+}: {
+  startedAt: number;
+  history: WatchSignal[];
+  feedback: Record<number, "like" | "dislike">;
+  reason: string;
+}): RecommendationResponse => ({
+  source: "fallback",
+  latencyMs: Date.now() - startedAt,
+  items: fallbackRecommendations({ history, feedback, count: 10 }),
+  fallbackReason: reason,
+});
+
+const extractErrorMessage = async (response: Response) => {
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text) as {
+      error?: { message?: string; status?: string };
+    };
+    return (
+      parsed.error?.message ||
+      parsed.error?.status ||
+      `Gemini request failed with status ${response.status}`
+    );
+  } catch {
+    return text || `Gemini request failed with status ${response.status}`;
+  }
+};
+
 const buildPrompt = (history: WatchSignal[]) => {
   const compactHistory = history.map((item) => ({
     title: item.title,
@@ -59,6 +92,52 @@ const parseGeminiJson = (rawText: string) => {
   };
 };
 
+const clampTimeoutMs = (value: string | undefined, fallback: number) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(60_000, Math.max(5_000, Math.floor(parsed)));
+};
+
+const GEMINI_TIMEOUT_MS = clampTimeoutMs(process.env.GEMINI_TIMEOUT_MS, 25_000);
+const GEMINI_RETRY_TIMEOUT_MS = clampTimeoutMs(
+  process.env.GEMINI_RETRY_TIMEOUT_MS,
+  35_000,
+);
+const MAX_HISTORY_ITEMS = 30;
+
+const requestGemini = async ({
+  apiKey,
+  prompt,
+  timeoutMs,
+}: {
+  apiKey: string;
+  prompt: string;
+  timeoutMs: number;
+}) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.7,
+          },
+        }),
+        signal: controller.signal,
+      },
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const mapGeminiOutput = (items: NonNullable<ReturnType<typeof parseGeminiJson>["recommendations"]>) => {
   const nextIdStart = 900_000;
 
@@ -91,42 +170,42 @@ export async function POST(request: Request) {
 
   const history = body.history ?? [];
   const feedback = body.feedback ?? {};
+  const historyForPrompt = history.slice(-MAX_HISTORY_ITEMS);
 
-  const fallbackPayload: RecommendationResponse = {
-    source: "fallback",
-    latencyMs: Date.now() - startedAt,
-    items: fallbackRecommendations({ history, feedback, count: 10 }),
-  };
+  const fallbackPayload = (reason: string) =>
+    buildFallbackPayload({ startedAt, history, feedback, reason });
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
-    return NextResponse.json(fallbackPayload);
+    return NextResponse.json(
+      fallbackPayload("Gemini API key not configured on the server."),
+    );
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3_500);
-
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: buildPrompt(history) }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.7,
-          },
-        }),
-        signal: controller.signal,
-      },
-    );
+    const prompt = buildPrompt(historyForPrompt);
 
-    clearTimeout(timeout);
+    let response: Response;
+    try {
+      response = await requestGemini({
+        apiKey,
+        prompt,
+        timeoutMs: GEMINI_TIMEOUT_MS,
+      });
+    } catch (error) {
+      const isTimeout = error instanceof Error && error.name === "AbortError";
+      if (!isTimeout) throw error;
+
+      response = await requestGemini({
+        apiKey,
+        prompt,
+        timeoutMs: GEMINI_RETRY_TIMEOUT_MS,
+      });
+    }
 
     if (!response.ok) {
-      return NextResponse.json(fallbackPayload);
+      const errorMessage = await extractErrorMessage(response);
+      return NextResponse.json(fallbackPayload(errorMessage));
     }
 
     const payload = (await response.json()) as {
@@ -141,14 +220,18 @@ export async function POST(request: Request) {
         .join("\n") ?? "";
 
     if (!rawText) {
-      return NextResponse.json(fallbackPayload);
+      return NextResponse.json(
+        fallbackPayload("Gemini returned an empty response."),
+      );
     }
 
     const parsed = parseGeminiJson(rawText);
     const mapped = mapGeminiOutput(parsed.recommendations ?? []);
 
     if (!mapped.length) {
-      return NextResponse.json(fallbackPayload);
+      return NextResponse.json(
+        fallbackPayload("Gemini response did not contain usable recommendations."),
+      );
     }
 
     return NextResponse.json({
@@ -156,8 +239,15 @@ export async function POST(request: Request) {
       latencyMs: Date.now() - startedAt,
       items: mapped.slice(0, 10),
     } satisfies RecommendationResponse);
-  } catch {
-    clearTimeout(timeout);
-    return NextResponse.json(fallbackPayload);
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.name === "AbortError"
+          ? `Gemini request timed out after retry (${GEMINI_TIMEOUT_MS}ms + ${GEMINI_RETRY_TIMEOUT_MS}ms).`
+          : error.message
+        : "Gemini request failed or timed out.";
+    return NextResponse.json(
+      fallbackPayload(message),
+    );
   }
 }

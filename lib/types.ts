@@ -58,6 +58,7 @@ export interface RecommendationResponse {
   source: "gemini" | "fallback";
   latencyMs: number;
   items: RecommendationItem[];
+  fallbackReason?: string;
 }
 
 export interface VibeResponse {
@@ -65,4 +66,5 @@ export interface VibeResponse {
   latencyMs: number;
   vibeSummary: string;
   items: RecommendationItem[];
+  fallbackReason?: string;
 }

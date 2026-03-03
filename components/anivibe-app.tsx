@@ -56,6 +56,11 @@ interface PersistedState {
   feedback: Record<number, FeedbackVote>;
 }
 
+interface PosterLookupResult {
+  posterImageUrl: string | null;
+  posterColor: string;
+}
+
 const STORAGE_KEY = "anivibe-state-v1";
 const WATCHLIST_PAGE_SIZE = 2;
 const SEARCH_RESULTS_PAGE_SIZE = 9;
@@ -78,6 +83,16 @@ const posterGradients = [
 const toneBuckets = ["Dark", "Emotional", "Wholesome", "High-energy"];
 
 const normaliseTitle = (title: string) => title.trim().toLowerCase();
+
+const clampRating = (value: number) =>
+  Math.min(10, Math.max(1, Math.round(value)));
+
+const resolveCompletedRating = (rating: number | null) => {
+  if (typeof rating !== "number" || Number.isNaN(rating)) {
+    return 1;
+  }
+  return clampRating(rating);
+};
 
 const buildPosterStyle = (
   anime: Pick<CatalogAnime, "posterGradient" | "posterImageUrl">,
@@ -130,6 +145,9 @@ export default function AniVibeApp() {
 
   const [recommendations, setRecommendations] = useState<RecommendationResponse | null>(null);
   const [recommendationLoading, setRecommendationLoading] = useState(false);
+  const [recommendationPosterByTitle, setRecommendationPosterByTitle] = useState<
+    Record<string, PosterLookupResult>
+  >({});
 
   const [vibeQuery, setVibeQuery] = useState("");
   const [vibeResponse, setVibeResponse] = useState<VibeResponse | null>(null);
@@ -146,6 +164,9 @@ export default function AniVibeApp() {
     useState(false);
   const [showSearchSuggestions, setShowSearchSuggestions] = useState(false);
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
+  const [quickAddStatusByAnimeId, setQuickAddStatusByAnimeId] = useState<
+    Record<number, WatchStatus>
+  >({});
   const [watchlistPageByStatus, setWatchlistPageByStatus] = useState<
     Record<WatchStatus, number>
   >(() =>
@@ -161,6 +182,7 @@ export default function AniVibeApp() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isHydrated, setIsHydrated] = useState(false);
   const posterLookupAttemptedRef = useRef(new Set<number>());
+  const recommendationPosterLookupAttemptedRef = useRef(new Set<string>());
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
 
   const catalogMap = useMemo(() => {
@@ -480,14 +502,118 @@ export default function AniVibeApp() {
     };
   }, [catalog, isHydrated]);
 
+  useEffect(() => {
+    const items = recommendations?.items ?? [];
+    if (!items.length) return;
+
+    const titlesToLookup = items
+      .map((item) => item.title)
+      .map((title) => title.trim())
+      .filter(Boolean)
+      .filter((title) => {
+        const key = normaliseTitle(title);
+        if (recommendationPosterLookupAttemptedRef.current.has(key)) {
+          return false;
+        }
+
+        const existingCatalogAnime = catalog.find(
+          (anime) => normaliseTitle(anime.title) === key,
+        );
+
+        if (existingCatalogAnime?.posterImageUrl) {
+          return false;
+        }
+
+        return true;
+      });
+
+    if (!titlesToLookup.length) return;
+
+    for (const title of titlesToLookup) {
+      recommendationPosterLookupAttemptedRef.current.add(normaliseTitle(title));
+    }
+
+    let cancelled = false;
+
+    const lookupPosters = async () => {
+      const results = await Promise.all(
+        titlesToLookup.map(async (title) => {
+          try {
+            const response = await fetch(
+              `/api/anilist/search?q=${encodeURIComponent(title)}`,
+            );
+
+            if (!response.ok) return null;
+
+            const payload = (await response.json()) as {
+              items?: AniListSearchResult[];
+            };
+
+            const candidates = payload.items ?? [];
+            const exact = candidates.find(
+              (candidate) =>
+                normaliseTitle(candidate.title) === normaliseTitle(title),
+            );
+            const best = exact ?? candidates[0];
+
+            if (!best) return null;
+
+            return {
+              key: normaliseTitle(title),
+              value: {
+                posterImageUrl: best.posterImageUrl,
+                posterColor: best.posterColor,
+              },
+            };
+          } catch {
+            return null;
+          }
+        }),
+      );
+
+      if (cancelled) return;
+
+      const updates = results.filter(
+        (result): result is NonNullable<typeof result> => Boolean(result),
+      );
+
+      if (!updates.length) return;
+
+      setRecommendationPosterByTitle((current) => {
+        const next = { ...current };
+        for (const update of updates) {
+          next[update.key] = update.value;
+        }
+        return next;
+      });
+    };
+
+    void lookupPosters();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [recommendations, catalog]);
+
   const setEntryPatch = (animeId: number, patch: Partial<WatchEntry>) => {
     setWatchlist((current) =>
       current.map((entry) =>
         entry.animeId === animeId
-          ? {
-              ...entry,
-              ...patch,
-            }
+          ? (() => {
+              const nextEntry = {
+                ...entry,
+                ...patch,
+              };
+
+              if (nextEntry.status === "Completed") {
+                return {
+                  ...nextEntry,
+                  rating: resolveCompletedRating(nextEntry.rating),
+                };
+              }
+
+              return nextEntry;
+            })()
           : entry,
       ),
     );
@@ -524,10 +650,26 @@ export default function AniVibeApp() {
       }
       setStatusMessage("Anime added to your tracking list.");
       return [
-        { animeId, status, progress: 0, rating: null, review: "" },
+        {
+          animeId,
+          status,
+          progress: 0,
+          rating: status === "Completed" ? 1 : null,
+          review: "",
+        },
         ...current,
       ];
     });
+  };
+
+  const getQuickAddStatus = (animeId: number) =>
+    quickAddStatusByAnimeId[animeId] ?? "Plan-to-Watch";
+
+  const setQuickAddStatus = (animeId: number, status: WatchStatus) => {
+    setQuickAddStatusByAnimeId((current) => ({
+      ...current,
+      [animeId]: status,
+    }));
   };
 
   const removeFromWatchlist = (animeId: number) => {
@@ -631,7 +773,10 @@ export default function AniVibeApp() {
     setFeedback((current) => ({ ...current, [animeId]: vote }));
   };
 
-  const ensureRecommendationTracked = (item: RecommendationItem) => {
+  const ensureRecommendationTracked = (
+    item: RecommendationItem,
+    status: WatchStatus = "Plan-to-Watch",
+  ) => {
     const existing = catalog.find((anime) => normaliseTitle(anime.title) === normaliseTitle(item.title));
     const animeId = existing?.id ?? item.id;
 
@@ -654,7 +799,7 @@ export default function AniVibeApp() {
       ]);
     }
 
-    addToWatchlist(animeId, "Plan-to-Watch");
+    addToWatchlist(animeId, status);
   };
 
   return (
@@ -819,7 +964,7 @@ export default function AniVibeApp() {
                   disabled={searchLoading}
                   className="h-11 rounded-xl bg-[var(--accent)] px-4 text-sm font-medium text-white transition hover:opacity-90 disabled:opacity-60"
                 >
-                  {searchLoading ? "Searching..." : "Search & Add"}
+                  {searchLoading ? "Searching..." : "Search"}
                 </button>
               </div>
 
@@ -858,12 +1003,25 @@ export default function AniVibeApp() {
                           type="button"
                           onClick={() => {
                             addCatalogAnime(result);
-                            addToWatchlist(result.id);
+                            addToWatchlist(result.id, getQuickAddStatus(result.id));
                           }}
                           className="mt-3 rounded-lg bg-[var(--secondary)] px-3 py-1.5 text-xs font-medium text-white"
                         >
-                          Add to Plan-to-Watch
+                          Add to List
                         </button>
+                        <select
+                          value={getQuickAddStatus(result.id)}
+                          onChange={(event) =>
+                            setQuickAddStatus(result.id, event.target.value as WatchStatus)
+                          }
+                          className="mt-2 h-8 w-full rounded-md border border-white/15 bg-[var(--bg)] px-2 text-xs outline-none"
+                        >
+                          {WATCH_STATUSES.map((status) => (
+                            <option key={status} value={status}>
+                              {status}
+                            </option>
+                          ))}
+                        </select>
                       </div>
                     </div>
                   ))}
@@ -977,16 +1135,16 @@ export default function AniVibeApp() {
                                 <>
                                   <label className="flex items-center justify-between text-xs text-[var(--muted)]">
                                     Rating
-                                    <span>{entry.rating ?? 0}/10</span>
+                                    <span>{resolveCompletedRating(entry.rating)}/10</span>
                                   </label>
                                   <input
                                     type="range"
                                     min={1}
                                     max={10}
-                                    value={entry.rating ?? 7}
+                                    value={resolveCompletedRating(entry.rating)}
                                     onChange={(event) =>
                                       setEntryPatch(entry.animeId, {
-                                        rating: Number(event.target.value),
+                                        rating: clampRating(Number(event.target.value)),
                                       })
                                     }
                                     className="w-full accent-[var(--accent)]"
@@ -1076,27 +1234,48 @@ export default function AniVibeApp() {
                   <span>Source: {recommendations.source === "gemini" ? "Gemini" : "Fallback"}</span>
                   <span>Latency: {recommendations.latencyMs}ms</span>
                 </div>
+                {recommendations.source === "fallback" && recommendations.fallbackReason ? (
+                  <p className="text-xs text-amber-300">
+                    Fallback reason: {recommendations.fallbackReason}
+                  </p>
+                ) : null}
 
                 <div className="grid gap-4 md:grid-cols-2">
                   {recommendations.items.map((item) => {
                     const linkedAnime = catalog.find(
                       (anime) => normaliseTitle(anime.title) === normaliseTitle(item.title),
                     );
+                    const lookedUpPoster = recommendationPosterByTitle[
+                      normaliseTitle(item.title)
+                    ];
 
                     return (
                       <article key={`${item.id}-${item.title}`} className="flex gap-4 rounded-xl border border-white/10 bg-[var(--surface)] p-4">
                         <div
                           className="h-40 w-28 flex-none rounded-lg md:h-44 md:w-32"
                           style={
-                            linkedAnime
+                            linkedAnime?.posterImageUrl
                               ? buildPosterStyle(
                                   linkedAnime,
                                   posterGradients[Math.abs(item.id) % posterGradients.length],
                                   "cover",
                                 )
+                              : lookedUpPoster?.posterImageUrl
+                                ? {
+                                    backgroundImage: `url('${lookedUpPoster.posterImageUrl}')`,
+                                    backgroundColor: "#0A0A0F",
+                                    backgroundSize: "cover",
+                                    backgroundPosition: "center",
+                                    backgroundRepeat: "no-repeat",
+                                  }
+                                : linkedAnime
+                                  ? buildPosterStyle(
+                                      linkedAnime,
+                                      posterGradients[Math.abs(item.id) % posterGradients.length],
+                                      "cover",
+                                    )
                               : {
-                                  background:
-                                    posterGradients[Math.abs(item.id) % posterGradients.length],
+                                  background: `linear-gradient(160deg, ${lookedUpPoster?.posterColor || "#7B5EFF"} 0%, #0A0A0F 100%)`,
                                 }
                           }
                         />
@@ -1150,11 +1329,26 @@ export default function AniVibeApp() {
                             </button>
                             <button
                               type="button"
-                              onClick={() => ensureRecommendationTracked(item)}
+                              onClick={() =>
+                                ensureRecommendationTracked(item, getQuickAddStatus(item.id))
+                              }
                               className="inline-flex items-center gap-1 rounded-md border border-[var(--secondary)]/40 bg-[var(--secondary)]/15 px-2.5 py-1.5 text-xs text-violet-200"
                             >
                               + Add to List
                             </button>
+                            <select
+                              value={getQuickAddStatus(item.id)}
+                              onChange={(event) =>
+                                setQuickAddStatus(item.id, event.target.value as WatchStatus)
+                              }
+                              className="h-8 rounded-md border border-white/15 bg-[var(--bg)] px-2 text-xs text-[var(--muted)] outline-none"
+                            >
+                              {WATCH_STATUSES.map((status) => (
+                                <option key={status} value={status}>
+                                  {status}
+                                </option>
+                              ))}
+                            </select>
                           </div>
                         </div>
                       </article>
@@ -1199,6 +1393,11 @@ export default function AniVibeApp() {
                     <span>Source: {vibeResponse.source === "gemini" ? "Gemini" : "Fallback"}</span>
                     <span>Latency: {vibeResponse.latencyMs}ms</span>
                   </div>
+                  {vibeResponse.source === "fallback" && vibeResponse.fallbackReason ? (
+                    <p className="mt-2 text-xs text-amber-300">
+                      Fallback reason: {vibeResponse.fallbackReason}
+                    </p>
+                  ) : null}
                   <p className="mt-2 text-sm text-white">{vibeResponse.vibeSummary}</p>
                 </div>
 
@@ -1237,13 +1436,30 @@ export default function AniVibeApp() {
                           </span>
                         ))}
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => ensureRecommendationTracked(item)}
-                        className="mt-3 rounded-md bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-white"
-                      >
-                        Add to Plan-to-Watch
-                      </button>
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            ensureRecommendationTracked(item, getQuickAddStatus(item.id))
+                          }
+                          className="rounded-md bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-white"
+                        >
+                          Add to List
+                        </button>
+                        <select
+                          value={getQuickAddStatus(item.id)}
+                          onChange={(event) =>
+                            setQuickAddStatus(item.id, event.target.value as WatchStatus)
+                          }
+                          className="h-8 rounded-md border border-white/15 bg-[var(--bg)] px-2 text-xs text-[var(--muted)] outline-none"
+                        >
+                          {WATCH_STATUSES.map((status) => (
+                            <option key={status} value={status}>
+                              {status}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
                       </div>
                     </article>
                     );

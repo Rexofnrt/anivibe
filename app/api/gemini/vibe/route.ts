@@ -9,6 +9,38 @@ interface RequestBody {
   history?: WatchSignal[];
 }
 
+const buildFallbackPayload = ({
+  startedAt,
+  fallback,
+  reason,
+}: {
+  startedAt: number;
+  fallback: ReturnType<typeof fallbackVibeRecommendations>;
+  reason: string;
+}): VibeResponse => ({
+  source: "fallback",
+  latencyMs: Date.now() - startedAt,
+  vibeSummary: fallback.vibeSummary,
+  items: fallback.items,
+  fallbackReason: reason,
+});
+
+const extractErrorMessage = async (response: Response) => {
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text) as {
+      error?: { message?: string; status?: string };
+    };
+    return (
+      parsed.error?.message ||
+      parsed.error?.status ||
+      `Gemini request failed with status ${response.status}`
+    );
+  } catch {
+    return text || `Gemini request failed with status ${response.status}`;
+  }
+};
+
 const buildPrompt = (query: string, history: WatchSignal[]) => {
   const compactHistory = history.map((item) => ({
     title: item.title,
@@ -61,6 +93,52 @@ const parseGeminiJson = (rawText: string) => {
   };
 };
 
+const clampTimeoutMs = (value: string | undefined, fallback: number) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(60_000, Math.max(5_000, Math.floor(parsed)));
+};
+
+const GEMINI_TIMEOUT_MS = clampTimeoutMs(process.env.GEMINI_TIMEOUT_MS, 25_000);
+const GEMINI_RETRY_TIMEOUT_MS = clampTimeoutMs(
+  process.env.GEMINI_RETRY_TIMEOUT_MS,
+  35_000,
+);
+const MAX_HISTORY_ITEMS = 30;
+
+const requestGemini = async ({
+  apiKey,
+  prompt,
+  timeoutMs,
+}: {
+  apiKey: string;
+  prompt: string;
+  timeoutMs: number;
+}) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.8,
+          },
+        }),
+        signal: controller.signal,
+      },
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 export async function POST(request: Request) {
   const startedAt = Date.now();
 
@@ -73,6 +151,7 @@ export async function POST(request: Request) {
 
   const query = body.query?.trim() ?? "";
   const history = body.history ?? [];
+  const historyForPrompt = history.slice(-MAX_HISTORY_ITEMS);
 
   if (!query) {
     return NextResponse.json(
@@ -82,42 +161,40 @@ export async function POST(request: Request) {
   }
 
   const fallback = fallbackVibeRecommendations({ query, history, count: 8 });
-  const fallbackPayload: VibeResponse = {
-    source: "fallback",
-    latencyMs: Date.now() - startedAt,
-    vibeSummary: fallback.vibeSummary,
-    items: fallback.items,
-  };
+  const fallbackPayload = (reason: string) =>
+    buildFallbackPayload({ startedAt, fallback, reason });
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
-    return NextResponse.json(fallbackPayload);
+    return NextResponse.json(
+      fallbackPayload("Gemini API key not configured on the server."),
+    );
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3_500);
-
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: buildPrompt(query, history) }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.8,
-          },
-        }),
-        signal: controller.signal,
-      },
-    );
+    const prompt = buildPrompt(query, historyForPrompt);
 
-    clearTimeout(timeout);
+    let response: Response;
+    try {
+      response = await requestGemini({
+        apiKey,
+        prompt,
+        timeoutMs: GEMINI_TIMEOUT_MS,
+      });
+    } catch (error) {
+      const isTimeout = error instanceof Error && error.name === "AbortError";
+      if (!isTimeout) throw error;
+
+      response = await requestGemini({
+        apiKey,
+        prompt,
+        timeoutMs: GEMINI_RETRY_TIMEOUT_MS,
+      });
+    }
 
     if (!response.ok) {
-      return NextResponse.json(fallbackPayload);
+      const errorMessage = await extractErrorMessage(response);
+      return NextResponse.json(fallbackPayload(errorMessage));
     }
 
     const payload = (await response.json()) as {
@@ -132,7 +209,9 @@ export async function POST(request: Request) {
         .join("\n") ?? "";
 
     if (!rawText) {
-      return NextResponse.json(fallbackPayload);
+      return NextResponse.json(
+        fallbackPayload("Gemini returned an empty vibe response."),
+      );
     }
 
     const parsed = parseGeminiJson(rawText);
@@ -153,7 +232,9 @@ export async function POST(request: Request) {
     });
 
     if (!mapped.length) {
-      return NextResponse.json(fallbackPayload);
+      return NextResponse.json(
+        fallbackPayload("Gemini response did not contain usable vibe results."),
+      );
     }
 
     return NextResponse.json({
@@ -162,8 +243,15 @@ export async function POST(request: Request) {
       vibeSummary: parsed.vibeSummary,
       items: mapped.slice(0, 10),
     } satisfies VibeResponse);
-  } catch {
-    clearTimeout(timeout);
-    return NextResponse.json(fallbackPayload);
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.name === "AbortError"
+          ? `Gemini request timed out after retry (${GEMINI_TIMEOUT_MS}ms + ${GEMINI_RETRY_TIMEOUT_MS}ms).`
+          : error.message
+        : "Gemini request failed or timed out.";
+    return NextResponse.json(
+      fallbackPayload(message),
+    );
   }
 }
