@@ -294,6 +294,9 @@ export default function AniVibeApp() {
   const [recommendationPosterByTitle, setRecommendationPosterByTitle] = useState<
     Record<string, PosterLookupResult>
   >({});
+  const [vibePosterByTitle, setVibePosterByTitle] = useState<
+    Record<string, PosterLookupResult>
+  >({});
 
   const [vibeQuery, setVibeQuery] = useState("");
   const [vibeResponse, setVibeResponse] = useState<VibeResponse | null>(null);
@@ -828,6 +831,96 @@ export default function AniVibeApp() {
     };
   }, [recommendations, catalog]);
 
+  useEffect(() => {
+    const items = vibeResponse?.items ?? [];
+    if (!items.length) return;
+
+    const titlesToLookup = Array.from(
+      new Set(items.map((item) => item.title)),
+    )
+      .map((title) => title.trim())
+      .filter(Boolean)
+      .filter((title) => {
+        const key = normaliseTitle(title);
+        const existingCatalogAnime = catalog.find(
+          (anime) => normaliseTitle(anime.title) === key,
+        );
+
+        if (existingCatalogAnime?.posterImageUrl) {
+          return false;
+        }
+
+        if (key in vibePosterByTitle) {
+          return false;
+        }
+
+        return true;
+      });
+
+    if (!titlesToLookup.length) return;
+
+    let cancelled = false;
+
+    const lookupPosters = async () => {
+      const results = await Promise.all(
+        titlesToLookup.map(async (title) => {
+          try {
+            const response = await fetch(
+              `/api/anilist/search?q=${encodeURIComponent(title)}`,
+            );
+
+            if (!response.ok) return null;
+
+            const payload = (await response.json()) as {
+              items?: AniListSearchResult[];
+            };
+
+            const candidates = payload.items ?? [];
+            const exact = candidates.find(
+              (candidate) =>
+                normaliseTitle(candidate.title) === normaliseTitle(title),
+            );
+            const best = exact ?? candidates[0];
+
+            if (!best) return null;
+
+            return {
+              key: normaliseTitle(title),
+              value: {
+                posterImageUrl: best.posterImageUrl,
+                posterColor: best.posterColor,
+              },
+            };
+          } catch {
+            return null;
+          }
+        }),
+      );
+
+      if (cancelled) return;
+
+      const updates = results.filter(
+        (result): result is NonNullable<typeof result> => Boolean(result),
+      );
+
+      if (!updates.length) return;
+
+      setVibePosterByTitle((current) => {
+        const next = { ...current };
+        for (const update of updates) {
+          next[update.key] = update.value;
+        }
+        return next;
+      });
+    };
+
+    void lookupPosters();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [vibeResponse, catalog]);
+
   const setEntryPatch = (animeId: number, patch: Partial<WatchEntry>) => {
     setWatchlist((current) =>
       current.map((entry) =>
@@ -982,6 +1075,8 @@ export default function AniVibeApp() {
       return;
     }
 
+    // Reset lookup cache so each vibe run can retry missing posters without refresh.
+    setVibePosterByTitle({});
     setVibeLoading(true);
     setStatusMessage(null);
 
@@ -1652,20 +1747,37 @@ export default function AniVibeApp() {
                     const linkedAnime = catalog.find(
                       (anime) => normaliseTitle(anime.title) === normaliseTitle(item.title),
                     );
+                    const lookedUpPoster = vibePosterByTitle[
+                      normaliseTitle(item.title)
+                    ];
 
                     return (
                     <article key={`${item.id}-${item.title}`} className="overflow-hidden rounded-xl border border-white/10 bg-[var(--surface)]">
                       <div
                         className="h-32 md:h-40"
                         style={
-                          linkedAnime
+                          linkedAnime?.posterImageUrl
                             ? buildPosterStyle(
                                 linkedAnime,
                                 posterGradients[Math.abs(item.id) % posterGradients.length],
+                                "cover",
                               )
+                            : lookedUpPoster?.posterImageUrl
+                              ? {
+                                  backgroundImage: `url('${lookedUpPoster.posterImageUrl}')`,
+                                  backgroundColor: "#0A0A0F",
+                                  backgroundSize: "cover",
+                                  backgroundPosition: "center",
+                                  backgroundRepeat: "no-repeat",
+                                }
+                              : linkedAnime
+                                ? buildPosterStyle(
+                                    linkedAnime,
+                                    posterGradients[Math.abs(item.id) % posterGradients.length],
+                                    "cover",
+                                  )
                             : {
-                                background:
-                                  posterGradients[Math.abs(item.id) % posterGradients.length],
+                                background: `linear-gradient(160deg, ${lookedUpPoster?.posterColor || "#7B5EFF"} 0%, #0A0A0F 100%)`,
                               }
                         }
                       />
