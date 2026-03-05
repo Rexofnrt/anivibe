@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3,
@@ -36,6 +37,7 @@ import {
   WatchSignal,
   WatchStatus,
 } from "@/lib/types";
+import anivibeLogo from "@/app/logo.jpeg";
 
 type TabId = "tracker" | "discover" | "vibe" | "taste";
 
@@ -80,12 +82,156 @@ const posterGradients = [
   "linear-gradient(160deg, #111827 0%, #B45309 100%)",
 ];
 
-const toneBuckets = ["Dark", "Emotional", "Wholesome", "High-energy"];
+const toneBuckets = ["Dark", "Emotional", "Wholesome", "High-energy"] as const;
+type ToneBucket = (typeof toneBuckets)[number];
+
+const toneBucketRules: Array<{ bucket: ToneBucket; keywords: string[] }> = [
+  {
+    bucket: "Dark",
+    keywords: ["dark", "bleak", "noir", "grim", "brutal", "revenge", "horror"],
+  },
+  {
+    bucket: "Emotional",
+    keywords: [
+      "emotional",
+      "reflective",
+      "melanch",
+      "bittersweet",
+      "sad",
+      "heartfelt",
+      "character-driven",
+      "romantic",
+      "romance",
+      "healing",
+    ],
+  },
+  {
+    bucket: "Wholesome",
+    keywords: ["wholesome", "warm", "soothing", "hopeful", "cozy", "motivational"],
+  },
+  {
+    bucket: "High-energy",
+    keywords: ["high-energy", "energetic", "intense", "chaotic", "competitive", "aggressive"],
+  },
+];
+
+const genreToneFallbackRules: Array<{ bucket: ToneBucket; keywords: string[] }> = [
+  { bucket: "Dark", keywords: ["psychological", "crime", "thriller", "mystery", "horror"] },
+  { bucket: "Emotional", keywords: ["romance", "drama"] },
+  { bucket: "Wholesome", keywords: ["slice of life", "comedy"] },
+  { bucket: "High-energy", keywords: ["action", "sports"] },
+];
+
+const genreMetricRules: Array<{
+  keywords: string[];
+  complexity: number;
+  morality: number;
+  emotionalIntensity: number;
+}> = [
+  { keywords: ["romance"], complexity: -0.4, morality: -0.3, emotionalIntensity: 1.2 },
+  { keywords: ["drama"], complexity: 0.4, morality: 0.2, emotionalIntensity: 0.9 },
+  { keywords: ["slice of life"], complexity: -0.8, morality: -0.5, emotionalIntensity: 0.5 },
+  { keywords: ["action", "sports"], complexity: -0.2, morality: 0.1, emotionalIntensity: 0.5 },
+  { keywords: ["psychological", "mystery", "thriller", "crime"], complexity: 1.2, morality: 0.9, emotionalIntensity: 0.5 },
+  { keywords: ["comedy"], complexity: -0.7, morality: -0.5, emotionalIntensity: -0.2 },
+  { keywords: ["historical", "sci-fi", "cyberpunk"], complexity: 0.8, morality: 0.4, emotionalIntensity: 0.2 },
+];
+
+const toneMetricRules: Array<{
+  keywords: string[];
+  complexity: number;
+  morality: number;
+  emotionalIntensity: number;
+}> = [
+  { keywords: ["dark", "bleak", "noir", "brutal"], complexity: 0.7, morality: 1.0, emotionalIntensity: 0.5 },
+  { keywords: ["emotional", "reflective", "melanch", "sad", "bittersweet", "heartfelt"], complexity: 0.3, morality: 0.1, emotionalIntensity: 1.0 },
+  { keywords: ["wholesome", "warm", "soothing", "hopeful", "healing"], complexity: -0.5, morality: -0.7, emotionalIntensity: 0.4 },
+  { keywords: ["high-energy", "energetic", "intense", "chaotic", "competitive"], complexity: -0.4, morality: -0.1, emotionalIntensity: 0.5 },
+  { keywords: ["psychological", "mind-bending"], complexity: 1.1, morality: 0.9, emotionalIntensity: 0.6 },
+];
 
 const normaliseTitle = (title: string) => title.trim().toLowerCase();
 
 const clampRating = (value: number) =>
   Math.min(10, Math.max(1, Math.round(value)));
+
+const clampProfileMetric = (value: number) =>
+  Math.min(10, Math.max(1, Math.round(value * 10) / 10));
+
+const findRuleMatch = <TRule extends { keywords: string[] }>(
+  value: string,
+  rules: TRule[],
+): TRule | undefined => {
+  const normalised = value.trim().toLowerCase();
+  return rules.find((rule) =>
+    rule.keywords.some((keyword) => normalised.includes(keyword)),
+  );
+};
+
+const resolveToneBucket = (tone: string): ToneBucket | null => {
+  const direct = toneBuckets.find(
+    (bucket) => bucket.toLowerCase() === tone.trim().toLowerCase(),
+  );
+  if (direct) return direct;
+
+  const matchedRule = findRuleMatch(tone, toneBucketRules);
+  return matchedRule ? matchedRule.bucket : null;
+};
+
+const resolveGenreToneBucket = (genre: string): ToneBucket | null => {
+  const matchedRule = findRuleMatch(genre, genreToneFallbackRules);
+  return matchedRule ? matchedRule.bucket : null;
+};
+
+const inferToneFromGenres = (genres: string[]): string[] => {
+  const buckets = Array.from(
+    new Set(
+      genres
+        .map((genre) => resolveGenreToneBucket(genre))
+        .filter((bucket): bucket is ToneBucket => Boolean(bucket)),
+    ),
+  );
+
+  if (!buckets.length) {
+    return ["Emotional", "Reflective"];
+  }
+
+  return buckets;
+};
+
+const inferProfileMetrics = (
+  genres: string[],
+  tone: string[],
+): Pick<CatalogAnime, "complexity" | "morality" | "emotionalIntensity"> => {
+  let complexity = 6;
+  let morality = 6;
+  let emotionalIntensity = 6.5;
+
+  const uniqueGenres = Array.from(new Set(genres.map((item) => item.toLowerCase())));
+  const uniqueTone = Array.from(new Set(tone.map((item) => item.toLowerCase())));
+
+  for (const genre of uniqueGenres) {
+    const rule = findRuleMatch(genre, genreMetricRules);
+    if (!rule) continue;
+    complexity += rule.complexity;
+    morality += rule.morality;
+    emotionalIntensity += rule.emotionalIntensity;
+  }
+
+  for (const toneEntry of uniqueTone) {
+    const rule = findRuleMatch(toneEntry, toneMetricRules);
+    if (!rule) continue;
+    complexity += rule.complexity;
+    morality += rule.morality;
+    emotionalIntensity += rule.emotionalIntensity;
+  }
+
+  return {
+    complexity: clampProfileMetric(complexity),
+    morality: clampProfileMetric(morality),
+    emotionalIntensity: clampProfileMetric(emotionalIntensity),
+  };
+};
 
 const resolveCompletedRating = (rating: number | null) => {
   if (typeof rating !== "number" || Number.isNaN(rating)) {
@@ -232,15 +378,58 @@ export default function AniVibeApp() {
       weight: item.rating ? item.rating / 2 : item.status === "Completed" ? 3 : 1,
     }));
 
+    if (!weightedEntries.length) {
+      return {
+        hasData: false,
+        topGenres: [] as Array<{ genre: string; value: number }>,
+        toneDistribution: toneBuckets.map((bucket) => ({ name: bucket, value: 0 })),
+        complexity: 0,
+        morality: 0,
+        emotionalIntensity: 0,
+        narrativeSummary: "No taste profile yet. Add anime to your tracker to generate this score.",
+        moralitySummary: "No taste profile yet. Add anime to your tracker to generate this score.",
+        emotionSummary: "No taste profile yet. Add anime to your tracker to generate this score.",
+      };
+    }
+
     const genreScores = new Map<string, number>();
-    const toneScores = new Map<string, number>();
+    const toneBucketScores = new Map<ToneBucket, number>(
+      toneBuckets.map((bucket) => [bucket, 0]),
+    );
 
     for (const { item, weight } of weightedEntries) {
       for (const genre of item.genres) {
         genreScores.set(genre, (genreScores.get(genre) ?? 0) + weight);
       }
-      for (const tone of item.tone) {
-        toneScores.set(tone, (toneScores.get(tone) ?? 0) + weight);
+      const matchedToneBuckets = Array.from(
+        new Set(
+          item.tone
+            .map((tone) => resolveToneBucket(tone))
+            .filter((bucket): bucket is ToneBucket => Boolean(bucket)),
+        ),
+      );
+
+      const fallbackToneBuckets =
+        matchedToneBuckets.length > 0
+          ? matchedToneBuckets
+          : Array.from(
+              new Set(
+                item.genres
+                  .map((genre) => resolveGenreToneBucket(genre))
+                  .filter((bucket): bucket is ToneBucket => Boolean(bucket)),
+              ),
+            );
+
+      if (!fallbackToneBuckets.length) {
+        continue;
+      }
+
+      const weightPerBucket = weight / fallbackToneBuckets.length;
+      for (const bucket of fallbackToneBuckets) {
+        toneBucketScores.set(
+          bucket,
+          (toneBucketScores.get(bucket) ?? 0) + weightPerBucket,
+        );
       }
     }
 
@@ -249,17 +438,10 @@ export default function AniVibeApp() {
       .slice(0, 6)
       .map(([genre, value]) => ({ genre, value: Math.round(value * 10) / 10 }));
 
-    const toneBase = toneBuckets.map((bucket) => ({ bucket, value: 0 }));
-    for (const [tone, value] of toneScores.entries()) {
-      const bucket = toneBuckets.find((target) => tone.toLowerCase().includes(target.toLowerCase()));
-      if (bucket) {
-        const target = toneBase.find((row) => row.bucket === bucket);
-        if (target) target.value += value;
-      } else {
-        const energetic = toneBase.find((row) => row.bucket === "High-energy");
-        if (energetic) energetic.value += value * 0.35;
-      }
-    }
+    const toneBase = toneBuckets.map((bucket) => ({
+      bucket,
+      value: toneBucketScores.get(bucket) ?? 0,
+    }));
 
     const toneTotal = toneBase.reduce((sum, row) => sum + row.value, 0) || 1;
     const toneDistribution = toneBase.map((row) => ({
@@ -267,19 +449,15 @@ export default function AniVibeApp() {
       value: Math.round((row.value / toneTotal) * 100),
     }));
 
-    const weightedAverage = (
-      selector: (signal: WatchSignal) => number,
-      defaultValue: number,
-    ) => {
-      if (!weightedEntries.length) return defaultValue;
+    const weightedAverage = (selector: (signal: WatchSignal) => number) => {
       const weightedSum = weightedEntries.reduce((sum, row) => sum + selector(row.item) * row.weight, 0);
       const weightTotal = weightedEntries.reduce((sum, row) => sum + row.weight, 0) || 1;
       return Math.round((weightedSum / weightTotal) * 10) / 10;
     };
 
-    const complexity = weightedAverage((item) => item.complexity, 6.5);
-    const morality = weightedAverage((item) => item.morality, 6.5);
-    const emotionalIntensity = weightedAverage((item) => item.emotionalIntensity, 6.5);
+    const complexity = weightedAverage((item) => item.complexity);
+    const morality = weightedAverage((item) => item.morality);
+    const emotionalIntensity = weightedAverage((item) => item.emotionalIntensity);
 
     const narrativeSummary =
       complexity >= 7.5
@@ -297,6 +475,7 @@ export default function AniVibeApp() {
         : "You keep a mixed emotional profile with room for lighter, low-pressure titles.";
 
     return {
+      hasData: true,
       topGenres,
       toneDistribution,
       complexity,
@@ -313,9 +492,11 @@ export default function AniVibeApp() {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as Partial<PersistedState>;
-        if (parsed.catalog?.length) setCatalog(parsed.catalog);
-        if (parsed.watchlist?.length) setWatchlist(parsed.watchlist);
-        if (parsed.feedback) setFeedback(parsed.feedback);
+        if (Array.isArray(parsed.catalog)) setCatalog(parsed.catalog);
+        if (Array.isArray(parsed.watchlist)) setWatchlist(parsed.watchlist);
+        if (parsed.feedback && typeof parsed.feedback === "object") {
+          setFeedback(parsed.feedback as Record<number, FeedbackVote>);
+        }
       }
     } catch {
       setStatusMessage("Could not restore prior local state. Using fresh defaults.");
@@ -323,6 +504,58 @@ export default function AniVibeApp() {
       setIsHydrated(true);
     }
   }, []);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+
+    const seedCatalogIds = new Set(SEED_CATALOG.map((anime) => anime.id));
+    setCatalog((current) => {
+      let changed = false;
+
+      const next = current.map((anime) => {
+        if (seedCatalogIds.has(anime.id)) {
+          return anime;
+        }
+
+        const isLegacyFlatProfile =
+          (anime.complexity === 6.5 && anime.morality === 6.5 && anime.emotionalIntensity === 7) ||
+          (anime.complexity === 7 && anime.morality === 7 && anime.emotionalIntensity === 7);
+
+        const hasGenericTone =
+          anime.tone.length === 2 &&
+          anime.tone.includes("Emotional") &&
+          anime.tone.includes("Reflective");
+
+        if (!isLegacyFlatProfile && !hasGenericTone) {
+          return anime;
+        }
+
+        const inferredTone = anime.tone.length
+          ? anime.tone
+          : inferToneFromGenres(anime.genres);
+        const inferredProfile = inferProfileMetrics(anime.genres, inferredTone);
+
+        const needsUpdate =
+          anime.tone.join("|") !== inferredTone.join("|") ||
+          anime.complexity !== inferredProfile.complexity ||
+          anime.morality !== inferredProfile.morality ||
+          anime.emotionalIntensity !== inferredProfile.emotionalIntensity;
+
+        if (!needsUpdate) {
+          return anime;
+        }
+
+        changed = true;
+        return {
+          ...anime,
+          tone: inferredTone,
+          ...inferredProfile,
+        };
+      });
+
+      return changed ? next : current;
+    });
+  }, [isHydrated]);
 
   useEffect(() => {
     if (!isHydrated) return;
@@ -622,18 +855,21 @@ export default function AniVibeApp() {
   const addCatalogAnime = (input: AniListSearchResult) => {
     setCatalog((current) => {
       if (current.some((anime) => anime.id === input.id)) return current;
+
+      const genres = input.genres.length ? input.genres : ["Drama"];
+      const tone = inferToneFromGenres(genres);
+      const profile = inferProfileMetrics(genres, tone);
+
       return [
         {
           id: input.id,
           title: input.title,
-          genres: input.genres.length ? input.genres : ["Drama"],
-          tone: ["Emotional", "Reflective"],
+          genres,
+          tone,
           synopsis: input.synopsis,
           episodes: input.episodes || 12,
           popularity: Math.min(100, Math.max(30, input.popularity || 60)),
-          complexity: 6.5,
-          morality: 6.5,
-          emotionalIntensity: 7,
+          ...profile,
           posterGradient: `linear-gradient(160deg, ${input.posterColor || "#7B5EFF"} 0%, #0A0A0F 100%)`,
           posterImageUrl: input.posterImageUrl ?? undefined,
         },
@@ -781,18 +1017,20 @@ export default function AniVibeApp() {
     const animeId = existing?.id ?? item.id;
 
     if (!existing) {
+      const genres = item.genres.length ? item.genres : ["Drama"];
+      const tone = item.tone.length ? item.tone : inferToneFromGenres(genres);
+      const profile = inferProfileMetrics(genres, tone);
+
       setCatalog((current) => [
         {
           id: animeId,
           title: item.title,
-          genres: item.genres.length ? item.genres : ["Drama"],
-          tone: item.tone.length ? item.tone : ["Emotional"],
+          genres,
+          tone,
           synopsis: item.reason,
           episodes: 12,
           popularity: item.hiddenGem ? 45 : 70,
-          complexity: 7,
-          morality: 7,
-          emotionalIntensity: 7,
+          ...profile,
           posterGradient: posterGradients[Math.abs(animeId) % posterGradients.length],
         },
         ...current,
@@ -805,14 +1043,22 @@ export default function AniVibeApp() {
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
       <header className="border-b border-white/10 px-4 py-4 md:px-8">
-        <div className="mx-auto flex w-full max-w-7xl items-center justify-between">
-          <div>
+        <div className="mx-auto flex w-full max-w-7xl justify-center">
+          <div className="flex items-center gap-4 md:gap-6">
+          <div className="relative h-16 w-16 flex-none overflow-hidden rounded-xl border border-white/15 bg-black/20 md:h-24 md:w-24">
+            <Image
+              src={anivibeLogo}
+              alt="AniVibe logo"
+              fill
+              priority
+              className="object-cover"
+            />
+          </div>
+
+          <div className="min-w-0">
             <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">AniVibe</p>
             <h1 className="text-2xl font-bold md:text-3xl">Track. Discover. Understand your anime taste.</h1>
-            <p className="text-sm text-[var(--muted)]">Dark-mode first anime tracker powered by Gemini-ready recommendation routes.</p>
           </div>
-          <div className="hidden rounded-xl border border-white/15 bg-[var(--surface)] px-4 py-2 text-xs text-[var(--muted)] md:block">
-            Gemini key: {process.env.NEXT_PUBLIC_GEMINI_READY ?? "Set in .env.local"}
           </div>
         </div>
       </header>
@@ -1475,17 +1721,23 @@ export default function AniVibeApp() {
             <div className="grid gap-4 md:grid-cols-3">
               <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
                 <p className="text-xs uppercase tracking-wider text-[var(--muted)]">Narrative Complexity</p>
-                <p className="mt-2 text-2xl font-bold text-white">{profileSummary.complexity}/10</p>
+                <p className="mt-2 text-2xl font-bold text-white">
+                  {profileSummary.hasData ? `${profileSummary.complexity}/10` : "N/A"}
+                </p>
                 <p className="mt-2 text-sm text-[var(--muted)]">{profileSummary.narrativeSummary}</p>
               </div>
               <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
                 <p className="text-xs uppercase tracking-wider text-[var(--muted)]">Morality Spectrum</p>
-                <p className="mt-2 text-2xl font-bold text-white">{profileSummary.morality}/10</p>
+                <p className="mt-2 text-2xl font-bold text-white">
+                  {profileSummary.hasData ? `${profileSummary.morality}/10` : "N/A"}
+                </p>
                 <p className="mt-2 text-sm text-[var(--muted)]">{profileSummary.moralitySummary}</p>
               </div>
               <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
                 <p className="text-xs uppercase tracking-wider text-[var(--muted)]">Emotional Intensity</p>
-                <p className="mt-2 text-2xl font-bold text-white">{profileSummary.emotionalIntensity}/10</p>
+                <p className="mt-2 text-2xl font-bold text-white">
+                  {profileSummary.hasData ? `${profileSummary.emotionalIntensity}/10` : "N/A"}
+                </p>
                 <p className="mt-2 text-sm text-[var(--muted)]">{profileSummary.emotionSummary}</p>
               </div>
             </div>
@@ -1494,68 +1746,80 @@ export default function AniVibeApp() {
               <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
                 <h3 className="text-sm font-semibold">Dominant Genres</h3>
                 <div className="mt-3 h-72">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <RadarChart data={profileSummary.topGenres.map((item) => ({ subject: item.genre, A: item.value }))}>
-                      <PolarGrid stroke="rgba(255,255,255,0.12)" />
-                      <PolarAngleAxis dataKey="subject" tick={{ fill: "#A0A0C4", fontSize: 12 }} />
-                      <Radar
-                        name="Genre"
-                        dataKey="A"
-                        stroke="#FF458A"
-                        fill="#FF458A"
-                        fillOpacity={0.5}
-                      />
-                      <Tooltip
-                        contentStyle={{
-                          background: "#1A1F2C",
-                          border: "1px solid rgba(255,255,255,0.15)",
-                          borderRadius: 8,
-                          color: "#FFFFFF",
-                        }}
-                      />
-                    </RadarChart>
-                  </ResponsiveContainer>
+                  {profileSummary.hasData ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <RadarChart data={profileSummary.topGenres.map((item) => ({ subject: item.genre, A: item.value }))}>
+                        <PolarGrid stroke="rgba(255,255,255,0.12)" />
+                        <PolarAngleAxis dataKey="subject" tick={{ fill: "#A0A0C4", fontSize: 12 }} />
+                        <Radar
+                          name="Genre"
+                          dataKey="A"
+                          stroke="#FF458A"
+                          fill="#FF458A"
+                          fillOpacity={0.5}
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            background: "#1A1F2C",
+                            border: "1px solid rgba(255,255,255,0.15)",
+                            borderRadius: 8,
+                            color: "#FFFFFF",
+                          }}
+                        />
+                      </RadarChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-white/15 text-sm text-[var(--muted)]">
+                      No genre signal yet.
+                    </div>
+                  )}
                 </div>
               </div>
 
               <div className="rounded-2xl border border-white/10 bg-[var(--surface)] p-4">
                 <h3 className="text-sm font-semibold">Tone Distribution</h3>
                 <div className="mt-3 h-72">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Pie
-                        data={profileSummary.toneDistribution}
-                        dataKey="value"
-                        nameKey="name"
-                        innerRadius={60}
-                        outerRadius={96}
-                        paddingAngle={2}
-                      >
-                        {profileSummary.toneDistribution.map((entry) => (
-                          <Cell
-                            key={entry.name}
-                            fill={
-                              entry.name === "Dark"
-                                ? "#FF458A"
-                                : entry.name === "Emotional"
-                                  ? "#7B5EFF"
-                                  : entry.name === "Wholesome"
-                                    ? "#4CAF50"
-                                    : "#FFC107"
-                            }
-                          />
-                        ))}
-                      </Pie>
-                      <Tooltip
-                        contentStyle={{
-                          background: "#1A1F2C",
-                          border: "1px solid rgba(255,255,255,0.15)",
-                          borderRadius: 8,
-                          color: "#FFFFFF",
-                        }}
-                      />
-                    </PieChart>
-                  </ResponsiveContainer>
+                  {profileSummary.hasData ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={profileSummary.toneDistribution}
+                          dataKey="value"
+                          nameKey="name"
+                          innerRadius={60}
+                          outerRadius={96}
+                          paddingAngle={2}
+                        >
+                          {profileSummary.toneDistribution.map((entry) => (
+                            <Cell
+                              key={entry.name}
+                              fill={
+                                entry.name === "Dark"
+                                  ? "#FF458A"
+                                  : entry.name === "Emotional"
+                                    ? "#7B5EFF"
+                                    : entry.name === "Wholesome"
+                                      ? "#4CAF50"
+                                      : "#FFC107"
+                              }
+                            />
+                          ))}
+                        </Pie>
+                        <Tooltip
+                          contentStyle={{
+                            background: "#1A1F2C",
+                            border: "1px solid rgba(255,255,255,0.15)",
+                            borderRadius: 8,
+                            color: "#FFFFFF",
+                          }}
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-white/15 text-sm text-[var(--muted)]">
+                      No tone signal yet.
+                    </div>
+                  )}
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-xs text-[var(--muted)]">
                   {profileSummary.toneDistribution.map((entry) => (
@@ -1572,13 +1836,19 @@ export default function AniVibeApp() {
                 <Heart size={16} className="text-[var(--accent)]" />
                 AniVibe Insight Narrative
               </p>
-              <p className="mt-2 text-sm text-[var(--muted)]">
-                Your profile favors {profileSummary.topGenres.slice(0, 2).map((item) => item.genre).join(" and ")} stories with
-                {" "}
-                {profileSummary.complexity >= 7 ? "high structural depth" : "balanced pacing"}. You respond strongly to
-                {" "}
-                {profileSummary.toneDistribution[0]?.name.toLowerCase() ?? "mixed"} tones and character-driven emotional arcs.
-              </p>
+              {profileSummary.hasData ? (
+                <p className="mt-2 text-sm text-[var(--muted)]">
+                  Your profile favors {profileSummary.topGenres.slice(0, 2).map((item) => item.genre).join(" and ")} stories with
+                  {" "}
+                  {profileSummary.complexity >= 7 ? "high structural depth" : "balanced pacing"}. You respond strongly to
+                  {" "}
+                  {profileSummary.toneDistribution[0]?.name.toLowerCase() ?? "mixed"} tones and character-driven emotional arcs.
+                </p>
+              ) : (
+                <p className="mt-2 text-sm text-[var(--muted)]">
+                  This panel updates after you track titles. Add anime to any status list to start building your taste profile.
+                </p>
+              )}
             </div>
           </section>
         ) : null}
