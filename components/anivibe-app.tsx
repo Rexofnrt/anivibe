@@ -260,6 +260,56 @@ const buildPosterStyle = (
   };
 };
 
+const simplifyTitle = (title: string) =>
+  normaliseTitle(title)
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const resolvePosterCandidate = (
+  results: AniListSearchResult[],
+  targetTitle: string,
+) => {
+  if (!results.length) return null;
+
+  const normalisedTarget = normaliseTitle(targetTitle);
+  const simplifiedTarget = simplifyTitle(targetTitle);
+
+  const exactWithPoster = results.find(
+    (item) =>
+      normaliseTitle(item.title) === normalisedTarget &&
+      Boolean(item.posterImageUrl),
+  );
+  if (exactWithPoster) return exactWithPoster;
+
+  const simplifiedExactWithPoster = results.find(
+    (item) =>
+      simplifyTitle(item.title) === simplifiedTarget &&
+      Boolean(item.posterImageUrl),
+  );
+  if (simplifiedExactWithPoster) return simplifiedExactWithPoster;
+
+  if (simplifiedTarget) {
+    const partialWithPoster = results.find((item) => {
+      if (!item.posterImageUrl) return false;
+      const simplifiedCandidate = simplifyTitle(item.title);
+      return (
+        simplifiedCandidate.includes(simplifiedTarget) ||
+        simplifiedTarget.includes(simplifiedCandidate)
+      );
+    });
+
+    if (partialWithPoster) return partialWithPoster;
+  }
+
+  return (
+    results.find((item) => Boolean(item.posterImageUrl)) ??
+    results.find((item) => normaliseTitle(item.title) === normalisedTarget) ??
+    results[0]
+  );
+};
+
 const toWatchSignal = (entry: WatchEntry, anime: CatalogAnime | undefined): WatchSignal | null => {
   if (!anime) return null;
   return {
@@ -689,10 +739,7 @@ export default function AniVibeApp() {
             };
 
             const results = payload.items ?? [];
-            const exactMatch = results.find(
-              (item) => normaliseTitle(item.title) === normaliseTitle(anime.title),
-            );
-            const bestMatch = exactMatch ?? results[0];
+            const bestMatch = resolvePosterCandidate(results, anime.title);
 
             if (!bestMatch?.posterImageUrl) return null;
 
@@ -774,35 +821,37 @@ export default function AniVibeApp() {
     const lookupPosters = async () => {
       const results = await Promise.all(
         titlesToLookup.map(async (title) => {
+          const key = normaliseTitle(title);
           try {
             const response = await fetch(
               `/api/anilist/search?q=${encodeURIComponent(title)}`,
             );
 
-            if (!response.ok) return null;
+            if (!response.ok) {
+              return { key, value: null, shouldRetry: true };
+            }
 
             const payload = (await response.json()) as {
               items?: AniListSearchResult[];
             };
 
             const candidates = payload.items ?? [];
-            const exact = candidates.find(
-              (candidate) =>
-                normaliseTitle(candidate.title) === normaliseTitle(title),
-            );
-            const best = exact ?? candidates[0];
+            const best = resolvePosterCandidate(candidates, title);
 
-            if (!best) return null;
+            if (!best) {
+              return { key, value: null, shouldRetry: false };
+            }
 
             return {
-              key: normaliseTitle(title),
+              key,
               value: {
                 posterImageUrl: best.posterImageUrl,
                 posterColor: best.posterColor,
               },
+              shouldRetry: false,
             };
           } catch {
-            return null;
+            return { key, value: null, shouldRetry: true };
           }
         }),
       );
@@ -810,18 +859,29 @@ export default function AniVibeApp() {
       if (cancelled) return;
 
       const updates = results.filter(
-        (result): result is NonNullable<typeof result> => Boolean(result),
+        (result): result is { key: string; value: PosterLookupResult; shouldRetry: boolean } =>
+          Boolean(result.value),
       );
 
-      if (!updates.length) return;
+      if (updates.length) {
+        setRecommendationPosterByTitle((current) => {
+          const next = { ...current };
+          for (const update of updates) {
+            next[update.key] = update.value;
+          }
+          return next;
+        });
+      }
 
-      setRecommendationPosterByTitle((current) => {
-        const next = { ...current };
-        for (const update of updates) {
-          next[update.key] = update.value;
+      const retryKeys = results
+        .filter((result) => result.shouldRetry)
+        .map((result) => result.key);
+
+      if (retryKeys.length) {
+        for (const key of retryKeys) {
+          recommendationPosterLookupAttemptedRef.current.delete(key);
         }
-        return next;
-      });
+      }
     };
 
     void lookupPosters();
@@ -876,11 +936,7 @@ export default function AniVibeApp() {
             };
 
             const candidates = payload.items ?? [];
-            const exact = candidates.find(
-              (candidate) =>
-                normaliseTitle(candidate.title) === normaliseTitle(title),
-            );
-            const best = exact ?? candidates[0];
+            const best = resolvePosterCandidate(candidates, title);
 
             if (!best) return null;
 
@@ -919,7 +975,7 @@ export default function AniVibeApp() {
     return () => {
       cancelled = true;
     };
-  }, [vibeResponse, catalog]);
+  }, [vibeResponse, catalog, vibePosterByTitle]);
 
   const setEntryPatch = (animeId: number, patch: Partial<WatchEntry>) => {
     setWatchlist((current) =>

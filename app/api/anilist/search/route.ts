@@ -13,6 +13,7 @@ const query = `
         episodes
         averageScore
         description(asHtml: false)
+        bannerImage
         coverImage {
           color
           medium
@@ -59,6 +60,7 @@ export async function GET(request: NextRequest) {
             episodes: number | null;
             averageScore: number | null;
             description: string | null;
+            bannerImage: string | null;
             coverImage: {
               color: string | null;
               medium: string | null;
@@ -82,6 +84,7 @@ export async function GET(request: NextRequest) {
         anime.coverImage?.extraLarge ??
         anime.coverImage?.large ??
         anime.coverImage?.medium ??
+        anime.bannerImage ??
         null,
     }));
 
